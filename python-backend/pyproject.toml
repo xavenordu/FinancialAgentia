@@ -1,0 +1,12 @@
+[project]
+name = "dexter-py"
+version = "0.1.0"
+description = "Python port/skeleton of Dexter backend"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.poetry]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

@@ -7,6 +7,8 @@ import os
 import asyncio
 import json
 from typing import Optional, Any, AsyncGenerator, Type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import pybreaker
 
 # Try to import langchain; if not available, we'll raise a helpful error at runtime.
 try:
@@ -118,7 +120,15 @@ async def call_llm(
                 return str(gen)
         raise RuntimeError('No supported call method on chat model')
 
-    result = await asyncio.to_thread(_sync_call)
+    # Add retries and a circuit breaker around provider calls to improve resilience
+    breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception_type(Exception))
+    def _resilient_sync_call():
+        # Use the circuit breaker to call the provider; pybreaker will raise on open circuit
+        return breaker.call(_sync_call)
+
+    result = await asyncio.to_thread(_resilient_sync_call)
 
     # Extract text content if it's a message-like object
     content: str
@@ -165,7 +175,14 @@ async def call_llm_stream(
     if hasattr(chat, 'stream'):
         # Best-effort: langchain stream APIs vary; attempt a common pattern
         try:
-            stream = chat.stream([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
+            # Wrap the stream creation in a small resilient wrapper
+            breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
+
+            @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception_type(Exception))
+            def _get_stream():
+                return breaker.call(lambda: chat.stream([SystemMessage(content=system_prompt), HumanMessage(content=prompt)]))
+
+            stream = await asyncio.to_thread(_get_stream)
             for chunk in stream:
                 # Each chunk may be a message-like object
                 if hasattr(chunk, 'content'):

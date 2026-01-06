@@ -77,6 +77,14 @@ Important variables:
 - `GOOGLE_API_KEY` — Google GenAI key (optional)
 - `BACKEND_API_KEY` — Optional simple auth for the Python backend; if set, clients must send the header `X-API-Key: <value>`
 
+Secrets & Authentication (recommended):
+
+- Do not store secrets in files in Git. Prefer a secrets manager such as AWS Secrets Manager, Azure Key Vault, or HashiCorp Vault for production. On CI providers you can add them as encrypted secrets.
+- The Python backend supports two modes:
+  - JWT-based tokens: set `JWT_SECRET` (HS256) and issue short-lived JWTs to clients. The backend will validate `Authorization: Bearer <token>` headers.
+  - Legacy API key: keep `BACKEND_API_KEY` for simple local/test setups. When `JWT_SECRET` is set the backend will prefer JWT validation.
+- Example (local): use an environment injection mechanism or a local secrets tool rather than committing keys. For example, with AWS Secrets Manager you can retrieve secrets at startup and populate environment variables in your deployment manifest.
+
 ---
 
 ## Running the backend (FastAPI)

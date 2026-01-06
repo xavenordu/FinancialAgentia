@@ -32,9 +32,15 @@ export interface ToolError {
   error: string;
 }
 
+interface SSETokenEvent {
+  token: string;
+  role?: string;
+  request_id?: string;
+}
+
 interface UseAgentExecutionResult {
   currentTurn: CurrentTurn | null;
-  answerStream: AsyncGenerator<string> | null;
+  answerStream: AsyncGenerator<SSETokenEvent> | null;
   isProcessing: boolean;
   toolErrors: ToolError[];
   processQuery: (query: string) => Promise<void>;
@@ -72,7 +78,7 @@ export function useAgentExecution({
   messageHistory,
 }: UseAgentExecutionOptions): UseAgentExecutionResult {
   const [currentTurn, setCurrentTurn] = useState<CurrentTurn | null>(null);
-  const [answerStream, setAnswerStream] = useState<AsyncGenerator<string> | null>(null);
+  const [answerStream, setAnswerStream] = useState<AsyncGenerator<SSETokenEvent> | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [toolErrors, setToolErrors] = useState<ToolError[]>([]);
 
@@ -354,9 +360,22 @@ export function useAgentExecution({
 
       try {
         // Send the prompt to the Python backend at /query
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        // If a backend API key or bearer token is provided in the environment, include it.
+        // Bundlers typically expose env vars via process.env.
+        // For production, inject secrets via a secure mechanism rather than bundling.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const env: any = (typeof process !== 'undefined' ? (process as any).env : undefined) || {};
+        if (env && env.BACKEND_API_KEY) {
+          headers['X-API-Key'] = env.BACKEND_API_KEY;
+        }
+        if (env && env.AUTH_BEARER) {
+          headers['Authorization'] = `Bearer ${env.AUTH_BEARER}`;
+        }
+
         const res = await fetch('http://localhost:8000/query', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({ prompt: query }),
         });
 
@@ -371,40 +390,107 @@ export function useAgentExecution({
           // Some runtimes provide a readable stream
           const reader = (res.body as unknown as ReadableStream<Uint8Array>).getReader();
           const decoder = new TextDecoder();
-          let done = false;
-          let buffer = '';
+
+          // Push-based queue so we can (a) provide an async generator to the UI
+          // and (b) also accumulate the full answer for message history.
+          const queue: SSETokenEvent[] = [];
+          let resolveNext: (() => void) | null = null;
+          let finished = false;
+          let finalParts: string[] = [];
+          let finishResolve: (() => void) | null = null;
+          const finishedPromise = new Promise<void>((r) => { finishResolve = r; });
+
+          const pushToken = (item: SSETokenEvent | string) => {
+            const ev: SSETokenEvent = typeof item === 'string' ? { token: item } : item;
+            queue.push(ev);
+            finalParts.push(ev.token);
+            if (resolveNext) {
+              resolveNext();
+              resolveNext = null;
+            }
+          };
+
+          const endQueue = () => {
+            finished = true;
+            if (resolveNext) {
+              resolveNext();
+              resolveNext = null;
+            }
+            if (finishResolve) finishResolve();
+          };
+
+          // Background reader loop: parse SSE events and push tokens.
+          (async () => {
+            try {
+              let buffer = '';
+              while (true) {
+                // eslint-disable-next-line no-await-in-loop
+                const { value, done: d } = await reader.read();
+                if (value) {
+                  buffer += decoder.decode(value, { stream: true });
+                  // Split on double-newline which delimits SSE events
+                  const parts = buffer.split('\n\n');
+                  // Keep the last partial event in buffer
+                  buffer = parts.pop() || '';
+                  for (const part of parts) {
+                    // Each part may contain multiple lines, e.g., "data: {...}\n"
+                    const lines = part.split('\n').map((l) => l.trim());
+                    const dataLines = lines.filter((l) => l.startsWith('data:'));
+                    if (dataLines.length === 0) continue;
+                    const dataStr = dataLines.map((l) => l.replace(/^data:\s?/, '')).join('\n');
+                    try {
+                      const obj = JSON.parse(dataStr);
+                      if (obj && typeof obj === 'object') {
+                        if (obj.token) {
+                          pushToken({ token: String(obj.token), role: obj.role, request_id: obj.request_id });
+                        } else if (typeof obj === 'string') {
+                          pushToken({ token: obj });
+                        } else if (obj.error) {
+                          // push an error marker
+                          pushToken({ token: `[ERROR] ${String(obj.error)}` });
+                        }
+                      }
+                    } catch (_err) {
+                      // Not JSON or partial; push raw data
+                      if (dataStr) pushToken({ token: dataStr });
+                    }
+                  }
+                }
+                if (d) break;
+              }
+            } catch (err) {
+              // If the reader fails, push an error token
+              try { pushToken({ token: `[STREAM_ERROR] ${String(err)}` }); } catch (_) {}
+            } finally {
+              endQueue();
+            }
+          })();
+
+          // Async generator exposes tokens to the UI
 
           async function* streamGenerator() {
-            while (!done) {
-              // eslint-disable-next-line no-await-in-loop
-              const { value, done: d } = await reader.read();
-              if (value) {
-                buffer += decoder.decode(value, { stream: true });
-                yield buffer;
+            while (!finished || queue.length > 0) {
+              if (queue.length === 0) {
+                // wait for next push
+                await new Promise<void>((res) => { resolveNext = res; });
+                continue;
               }
-              if (d) {
-                done = true;
-                break;
-              }
+              yield queue.shift()!;
             }
-            // Final chunk
-            if (buffer) yield buffer;
           }
 
-          // Use the async generator as the answerStream
-          setAnswerStream(streamGenerator());
-          // Consume final value for message history
-          let final = '';
-          for await (const chunk of streamGenerator()) {
-            final = chunk;
-          }
-          answerText = final;
+          const gen = streamGenerator();
+          setAnswerStream(gen);
+
+          // Wait for the reader to finish, then assemble final answer
+          await finishedPromise;
+          answerText = finalParts.join('');
         } catch (e) {
           // Fallback: read as JSON then extract response
           const data = await res.json();
           answerText = typeof data.response === 'string' ? data.response : JSON.stringify(data.response);
-          // Provide a simple non-streaming response to the UI
-          setAnswerStream((async function* () { yield answerText; })());
+          // Provide a simple non-streaming response to the UI (SSETokenEvent)
+          setAnswerStream((async function* () { yield { token: answerText }; })());
         }
 
         // Finalize

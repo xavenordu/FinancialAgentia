@@ -1,16 +1,13 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel
 from typing import AsyncGenerator
 import os
 import json
 import uuid
+import time
+from collections import deque
 
 # Structured logging
 import structlog
@@ -24,7 +21,7 @@ from slowapi.errors import RateLimitExceeded
 # Metrics
 from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
-from dexter_py.model.llm import call_llm_stream
+from ..dexter_py.model.llm import call_llm_stream
 
 
 # Configure structlog for JSON output
@@ -66,6 +63,8 @@ class Query(BaseModel):
 @app.on_event("startup")
 async def startup():
     logger.info("startup", event="starting dexter python backend")
+    # Initialize an in-memory recent requests store (rolling)
+    app.state.recent_requests = deque(maxlen=200)
 
 
 @app.on_event("shutdown")
@@ -93,6 +92,134 @@ async def ready():
 async def metrics():
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/api/recent")
+async def api_recent():
+        """Return recent requests for dashboard consumption."""
+        items = list(getattr(app.state, 'recent_requests', []))
+        # Convert timestamps to ISO for readability
+        out = []
+        for it in items:
+                o = dict(it)
+                try:
+                        o['ts_iso'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(o.get('timestamp', 0)))
+                except Exception:
+                        o['ts_iso'] = None
+                out.append(o)
+        return JSONResponse(content={"recent": out})
+
+
+@app.get("/dashboard")
+async def dashboard():
+        """Serve a minimal dashboard page that fetches /api/recent and /metrics."""
+        html = r'''
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Dexter Dashboard</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { border: 1px solid #ddd; padding: 8px; }
+            th { background: #f4f4f4; }
+            pre { background: #111; color: #0f0; padding: 10px; }
+        </style>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+    <body>
+        <h1>Dexter Dashboard</h1>
+        <p>Recent requests (most recent first)</p>
+        <table id="recent-table">
+            <thead><tr><th>Time</th><th>Path</th><th>Method</th><th>Status</th><th>Request ID</th><th>Prompt (snippet)</th></tr></thead>
+            <tbody></tbody>
+        </table>
+
+    <h2>Metrics</h2>
+    <pre id="metrics">Loading...</pre>
+
+    <h2>Per-client request durations</h2>
+    <canvas id="clientChart" width="800" height="200"></canvas>
+
+        <script>
+                    async function loadRecent() {
+                try {
+                    const res = await fetch('/api/recent');
+                    const data = await res.json();
+                    const tbody = document.querySelector('#recent-table tbody');
+                    tbody.innerHTML = '';
+                    for (const r of data.recent) {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `<td>${r.ts_iso || ''}</td><td>${r.path || ''}</td><td>${r.method || ''}</td><td>${r.status || ''}</td><td>${r.request_id || ''}</td><td>${(r.prompt||'').replace(/</g,'&lt;')}</td>`;
+                        tbody.appendChild(tr);
+                    }
+                            updateClientChart(data.recent);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+
+            async function loadMetrics() {
+                try {
+                    const res = await fetch('/metrics');
+                    const text = await res.text();
+                    document.getElementById('metrics').textContent = text;
+                } catch (e) {
+                    document.getElementById('metrics').textContent = 'Failed to load metrics: ' + e;
+                }
+            }
+
+            async function refresh() {
+                await Promise.all([loadRecent(), loadMetrics()]);
+            }
+
+                    // Chart.js setup
+                    let clientChart = null;
+                    function updateClientChart(recent) {
+                        try {
+                            // Aggregate by client host
+                            const byClient = {};
+                            for (const r of recent) {
+                                const client = r.client || 'unknown';
+                                if (!byClient[client]) byClient[client] = [];
+                                if (typeof r.duration_ms === 'number') byClient[client].push(r.duration_ms);
+                            }
+                            const labels = Object.keys(byClient);
+                            const avg = labels.map(l => {
+                                const arr = byClient[l];
+                                if (!arr || arr.length === 0) return 0;
+                                return Math.round(arr.reduce((a,b)=>a+b,0)/arr.length);
+                            });
+
+                            if (!clientChart) {
+                                const ctx = document.getElementById('clientChart').getContext('2d');
+                                // eslint-disable-next-line no-undef
+                                clientChart = new Chart(ctx, {
+                                    type: 'bar',
+                                    data: {
+                                        labels,
+                                        datasets: [{ label: 'Avg duration (ms)', data: avg, backgroundColor: 'rgba(54,162,235,0.5)' }]
+                                    },
+                                    options: { responsive: true, maintainAspectRatio: false }
+                                });
+                            } else {
+                                clientChart.data.labels = labels;
+                                clientChart.data.datasets[0].data = avg;
+                                clientChart.update();
+                            }
+                        } catch (e) {
+                            console.error('chart update failed', e);
+                        }
+                    }
+
+                    setInterval(refresh, 3000);
+                    refresh();
+        </script>
+    </body>
+</html>
+'''
+        return Response(content=html, media_type='text/html')
 
 
 def _verify_jwt(token: str) -> dict:
@@ -146,10 +273,26 @@ async def add_request_id_and_count(request: Request, call_next):
     REQUEST_COUNT.inc()
     # Add request_id to structlog context for the duration of the request
     structlog.contextvars.bind_contextvars(request_id=rid)
+    start = time.time()
     try:
         response = await call_next(request)
     finally:
         structlog.contextvars.clear_contextvars()
+    # Record a minimal request entry (prompt is recorded in /query)
+    try:
+        entry = {
+            "timestamp": time.time(),
+            "method": request.method,
+            "path": request.url.path,
+            "status": getattr(response, 'status_code', None),
+            "request_id": rid,
+            "duration_ms": int((time.time() - start) * 1000),
+            "client": request.client.host if request.client else None,
+        }
+        # Append to rolling deque
+        app.state.recent_requests.appendleft(entry)
+    except Exception:
+        pass
     response.headers["X-Request-Id"] = rid
     return response
 
@@ -166,6 +309,21 @@ async def query(request: Request, q: Query):
     await require_auth(request)
 
     request_id = getattr(request.state, "request_id", None)
+
+    # Record the incoming prompt in recent requests for dashboarding
+    try:
+        prompt_snippet = (q.prompt[:400] + '...') if len(q.prompt) > 400 else q.prompt
+        app.state.recent_requests.appendleft({
+            "timestamp": time.time(),
+            "request_id": request_id,
+            "path": request.url.path,
+            "method": request.method,
+            "prompt": prompt_snippet,
+            "client": request.client.host if request.client else None,
+        })
+    except Exception:
+        # best-effort; don't fail the request if logging fails
+        pass
 
     async def event_stream() -> AsyncGenerator[bytes, None]:
         try:

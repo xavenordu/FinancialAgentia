@@ -387,8 +387,6 @@ export function useAgentExecution({
         // Try to stream the response if possible, else read full text
         let answerText: string;
         try {
-          // Some runtimes provide a readable stream
-          const reader = (res.body as unknown as ReadableStream<Uint8Array>).getReader();
           const decoder = new TextDecoder();
 
           // Push-based queue so we can (a) provide an async generator to the UI
@@ -423,17 +421,49 @@ export function useAgentExecution({
           (async () => {
             try {
               let buffer = '';
-              while (true) {
-                // eslint-disable-next-line no-await-in-loop
-                const { value, done: d } = await reader.read();
-                if (value) {
-                  buffer += decoder.decode(value, { stream: true });
-                  // Split on double-newline which delimits SSE events
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const body: any = (res as any).body;
+              if (body && typeof body.getReader === 'function') {
+                // Browser-style ReadableStream
+                const webReader = body.getReader();
+                while (true) {
+                  // eslint-disable-next-line no-await-in-loop
+                  const { value, done: d } = await webReader.read();
+                  if (value) {
+                    buffer += decoder.decode(value, { stream: true });
+                    const parts = buffer.split('\n\n');
+                    buffer = parts.pop() || '';
+                    for (const part of parts) {
+                      const lines = part.split('\n').map((l) => l.trim());
+                      const dataLines = lines.filter((l) => l.startsWith('data:'));
+                      if (dataLines.length === 0) continue;
+                      const dataStr = dataLines.map((l) => l.replace(/^data:\s?/, '')).join('\n');
+                      try {
+                        const obj = JSON.parse(dataStr);
+                        if (obj && typeof obj === 'object') {
+                          if (obj.token) {
+                            pushToken({ token: String(obj.token), role: obj.role, request_id: obj.request_id });
+                          } else if (typeof obj === 'string') {
+                            pushToken({ token: obj });
+                          } else if (obj.error) {
+                            pushToken({ token: `[ERROR] ${String(obj.error)}` });
+                          }
+                        }
+                      } catch (_err) {
+                        if (dataStr) pushToken({ token: dataStr });
+                      }
+                    }
+                  }
+                  if (d) break;
+                }
+              } else if (body && typeof body[Symbol.asyncIterator] === 'function') {
+                // Node-style async iterator over Buffer/Uint8Array chunks
+                // eslint-disable-next-line no-restricted-syntax
+                for await (const chunk of body) {
+                  buffer += decoder.decode(chunk, { stream: true } as any);
                   const parts = buffer.split('\n\n');
-                  // Keep the last partial event in buffer
                   buffer = parts.pop() || '';
                   for (const part of parts) {
-                    // Each part may contain multiple lines, e.g., "data: {...}\n"
                     const lines = part.split('\n').map((l) => l.trim());
                     const dataLines = lines.filter((l) => l.startsWith('data:'));
                     if (dataLines.length === 0) continue;
@@ -446,20 +476,19 @@ export function useAgentExecution({
                         } else if (typeof obj === 'string') {
                           pushToken({ token: obj });
                         } else if (obj.error) {
-                          // push an error marker
                           pushToken({ token: `[ERROR] ${String(obj.error)}` });
                         }
                       }
                     } catch (_err) {
-                      // Not JSON or partial; push raw data
                       if (dataStr) pushToken({ token: dataStr });
                     }
                   }
                 }
-                if (d) break;
+              } else {
+                // No readable body available
+                pushToken({ token: '[NO_BODY]' });
               }
             } catch (err) {
-              // If the reader fails, push an error token
               try { pushToken({ token: `[STREAM_ERROR] ${String(err)}` }); } catch (_) {}
             } finally {
               endQueue();

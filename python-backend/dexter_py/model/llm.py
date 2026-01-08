@@ -23,50 +23,67 @@ try:
         from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
     except Exception:
         ChatGoogleGenerativeAI = None  # type: ignore
+    try:
+        from langchain_ollama import ChatOllama  # type: ignore
+    except Exception:
+        ChatOllama = None  # type: ignore
     from langchain_core.messages import HumanMessage, SystemMessage
 except ImportError:
     pass
 DEFAULT_PROVIDER = "openai"
-DEFAULT_MODEL = "gpt-3.5-turbo"
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+DEFAULT_MODEL = "ollama-gpt-oss:120b-cloud"
+DEFAULT_SYSTEM_PROMPT = (
+    "You are FinancialAgentia, an autonomous financial research agent.\n"
+    "Your primary objective is to conduct deep and thorough research on stocks and companies to answer user queries.\n"
+    "You are equipped with a set of powerful tools to gather and analyze financial data.\n"
+    "You should be methodical, breaking down complex questions into manageable steps and using your tools strategically to find the answers.\n"
+    "Always aim to provide accurate, comprehensive, and well-structured information to the user."
+)
 
+
+import os
 
 def get_chat_model(model_name: str = DEFAULT_MODEL, streaming: bool = False):
-    """Return a chat model instance. For now we support OpenAI via langchain.
-
-    Raises a RuntimeError if langchain is not installed or API key missing.
     """
+    Return a chat model instance. Supports Ollama (local/cloud), Anthropic, OpenAI,
+    and can be extended for other providers.
+    
+    Raises RuntimeError if required API keys are missing.
+    """
+    # --- Ensure OpenAI is available ---
     if ChatOpenAI is None:
         raise RuntimeError("langchain is required for the Python backend. Install from requirements.txt")
 
-    # Provider mapping by model name prefix (matches TypeScript mapping)
-    def default_factory(name: str, streaming_flag: bool):
-        if ChatOpenAI is None:
-            raise RuntimeError("langchain is required for the Python backend. Install from requirements.txt")
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY not set in environment")
-        return ChatOpenAI(model_name=name, openai_api_key=api_key)
-
+    # --- Define provider factories ---
     providers = {}
-    if 'ChatAnthropic' in globals() and ChatAnthropic is not None:
-        providers['claude-'] = lambda name, s: ChatAnthropic(model=name, streaming=s, anthropic_api_key=os.getenv('ANTHROPIC_API_KEY'))
-    if 'ChatGoogleGenerativeAI' in globals() and ChatGoogleGenerativeAI is not None:
-        providers['gemini-'] = lambda name, s: ChatGoogleGenerativeAI(model=name, streaming=s, api_key=os.getenv('GOOGLE_API_KEY'))
 
-    prefix = None
-    for p in providers.keys():
-        if model_name.startswith(p):
-            prefix = p
-            break
+    # Ollama
+    if 'ChatOllama' in globals() and ChatOllama is not None and model_name.startswith("ollama-"):
+        is_cloud = model_name.endswith("-cloud")
+        base_url = os.getenv("OLLAMA_BASE_URL", "https://ollama.com" if is_cloud else "http://localhost:11434")
+        api_key = os.getenv("OLLAMA_API_KEY") if is_cloud else None
+        model_clean = model_name.replace("ollama-", "")
+        return ChatOllama(model=model_clean, base_url=base_url, api_key=api_key, streaming=streaming)
 
-    if prefix:
-        factory = providers[prefix]
-        return factory(model_name, streaming)
+    # Anthropic
+    if 'ChatAnthropic' in globals() and ChatAnthropic is not None and model_name.startswith("claude-"):
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY not set in environment")
+        return ChatAnthropic(model=model_name, streaming=streaming, anthropic_api_key=api_key)
+
+    # Google (optional, only if installed)
+    if 'ChatGoogleGenerativeAI' in globals() and ChatGoogleGenerativeAI is not None and model_name.startswith("gemini-"):
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError("GOOGLE_API_KEY not set in environment")
+        return ChatGoogleGenerativeAI(model=model_name, streaming=streaming, api_key=api_key)
 
     # Fallback to OpenAI
-    return default_factory(model_name, streaming)
-
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set in environment")
+    return ChatOpenAI(model_name=model_name, openai_api_key=api_key, streaming=streaming)
 
 async def call_llm(
     prompt: str,

@@ -1,16 +1,16 @@
 from typing import Any, Dict, List, Optional, AsyncGenerator
 from dataclasses import dataclass
 
-from dexter_py.utils.context import ToolContextManager
-from dexter_py.utils.message_history import MessageHistory
-from dexter_py.tools import TOOLS
-from dexter_py.agent.phases.understand import UnderstandPhase
-from dexter_py.agent.phases.plan import PlanPhase
-from dexter_py.agent.phases.execute import ExecutePhase
-from dexter_py.agent.phases.reflect import ReflectPhase
-from dexter_py.agent.phases.answer import AnswerPhase
-from dexter_py.agent.tool_executor import ToolExecutor
-from dexter_py.agent.task_executor import TaskExecutor
+from ..utils.context import ToolContextManager
+from ..utils.message_history import MessageHistory
+from ..tools import TOOLS
+from .phases.understand import UnderstandPhase
+from .phases.plan import PlanPhase
+from .phases.execute import ExecutePhase
+from .phases.reflect import ReflectPhase
+from .phases.answer import AnswerPhase
+from .tool_executor import ToolExecutor
+from .task_executor import TaskExecutor
 
 
 DEFAULT_MAX_ITERATIONS = 5

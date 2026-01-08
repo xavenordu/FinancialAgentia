@@ -1,7 +1,7 @@
 from typing import Optional, Any
-from dexter_py.model.llm import call_llm
-from dexter_py.agent import schemas
-from dexter_py.agent.schemas import Plan, PlanTask
+from ...model.llm import call_llm
+from .. import schemas
+from ..schemas import Plan, PlanTask
 
 
 class PlanPhase:
@@ -31,7 +31,7 @@ class PlanPhase:
             prior_work_summary = self.format_prior_work(prior_plans, prior_results)
 
         # Import prompts lazily
-        from dexter_py.agent import prompts as _prompts
+        from .. import prompts as _prompts
 
         system_prompt = _prompts.getPlanSystemPrompt()
         user_prompt = _prompts.buildPlanUserPrompt(

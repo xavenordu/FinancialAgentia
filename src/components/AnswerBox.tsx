@@ -2,14 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Box, Text } from 'ink';
 import { colors } from '../theme.js';
 
-interface SSETokenEvent {
-  token: string;
-  role?: string;
-  request_id?: string;
-}
-
 interface AnswerBoxProps {
-  stream?: AsyncGenerator<string> | AsyncGenerator<SSETokenEvent>;
+  stream?: AsyncGenerator<string>;
   text?: string;
   onStart?: () => void;
   onComplete?: (answer: string) => void;
@@ -33,40 +27,14 @@ export const AnswerBox = React.memo(function AnswerBox({ stream, text, onStart, 
     
     (async () => {
       try {
-        for await (const chunk of stream as AsyncGenerator<any>) {
-          try {
-            // Log the raw chunk for debugging
-            // eslint-disable-next-line no-console
-            console.debug('AnswerBox received chunk:', chunk);
-          } catch (_) {}
-
-          let piece = '';
-          if (typeof chunk === 'string') {
-            piece = chunk;
-          } else if (chunk && typeof chunk === 'object' && 'token' in chunk) {
-            piece = String((chunk as SSETokenEvent).token || '');
-            // Also log metadata if present
-            try {
-              // eslint-disable-next-line no-console
-              console.debug('AnswerBox chunk meta:', { role: (chunk as SSETokenEvent).role, request_id: (chunk as SSETokenEvent).request_id });
-            } catch (_) {}
-          } else {
-            piece = String(chunk || '');
-          }
-
-          if (!started && piece.trim()) {
+        for await (const chunk of stream) {
+          if (!started && chunk.trim()) {
             started = true;
             onStartRef.current?.();
           }
-
-          collected += piece;
+          collected += chunk;
           setContent(collected);
         }
-      } catch (err) {
-        // Log streaming errors so the user can see them in the terminal
-        // eslint-disable-next-line no-console
-        console.error('AnswerBox stream error:', err);
-        throw err;
       } finally {
         setIsStreaming(false);
         onCompleteRef.current?.(collected);

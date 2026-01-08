@@ -1,7 +1,7 @@
 from typing import Optional, Any
-from dexter_py.model.llm import call_llm
-from dexter_py.agent import schemas
-from dexter_py.agent.schemas import Understanding
+from ...model.llm import call_llm
+from .. import schemas
+from ..schemas import Understanding
 
 
 class UnderstandPhase:
@@ -30,7 +30,7 @@ class UnderstandPhase:
                 pass
 
         # Import prompts lazily to avoid circular imports at module load
-        from dexter_py.agent import prompts as _prompts
+        from .. import prompts as _prompts
 
         system_prompt = _prompts.getUnderstandSystemPrompt()
         user_prompt = _prompts.buildUnderstandUserPrompt(query, conversation_context)

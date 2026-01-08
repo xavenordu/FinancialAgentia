@@ -2,8 +2,14 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Box, Text } from 'ink';
 import { colors } from '../theme.js';
 
+interface SSETokenEvent {
+  token: string;
+  role?: string;
+  request_id?: string;
+}
+
 interface AnswerBoxProps {
-  stream?: AsyncGenerator<string>;
+  stream?: AsyncGenerator<SSETokenEvent>;
   text?: string;
   onStart?: () => void;
   onComplete?: (answer: string) => void;
@@ -28,11 +34,11 @@ export const AnswerBox = React.memo(function AnswerBox({ stream, text, onStart, 
     (async () => {
       try {
         for await (const chunk of stream) {
-          if (!started && chunk.trim()) {
+          if (!started && chunk.token.trim()) {
             started = true;
             onStartRef.current?.();
           }
-          collected += chunk;
+          collected += chunk.token;
           setContent(collected);
         }
       } finally {

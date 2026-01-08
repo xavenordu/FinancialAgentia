@@ -378,9 +378,9 @@ export function useAgentExecution({
           headers,
           body: JSON.stringify({ prompt: query }),
         });
-
         if (!res.ok) {
           const text = await res.text();
+          console.error('Frontend: Backend error response', text);
           throw new Error(`Backend error: ${res.status} ${text}`);
         }
 
@@ -504,7 +504,8 @@ export function useAgentExecution({
                 await new Promise<void>((res) => { resolveNext = res; });
                 continue;
               }
-              yield queue.shift()!;
+              const token = queue.shift()!;
+              yield token;
             }
           }
 

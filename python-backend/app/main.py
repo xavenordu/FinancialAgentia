@@ -9,6 +9,11 @@ import uuid
 import time
 from collections import deque
 
+# Load environment variables
+from dotenv import load_dotenv
+import os
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+
 # Structured logging
 import structlog
 
@@ -59,17 +64,18 @@ REQUEST_COUNT = Counter("dexter_requests_total", "Total requests received")
 class Query(BaseModel):
     prompt: str
 
-
 @app.on_event("startup")
 async def startup():
-    logger.info("startup", event="starting dexter python backend")
-    # Initialize an in-memory recent requests store (rolling)
-    app.state.recent_requests = deque(maxlen=200)
+    logger.info(event="starting dexter python backend")
+
+    # Initialize a deque to hold recent requests for dashboarding
+    app.state.recent_requests = deque(maxlen=1000)
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    logger.info("shutdown", event="shutting down dexter python backend")
+    logger.info(event="shutting down dexter python backend")
+
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -310,6 +316,9 @@ async def query(request: Request, q: Query):
 
     request_id = getattr(request.state, "request_id", None)
 
+    # Log received data
+    logger.info("Received query", prompt=q.prompt, request_id=request_id)
+
     # Record the incoming prompt in recent requests for dashboarding
     try:
         prompt_snippet = (q.prompt[:400] + '...') if len(q.prompt) > 400 else q.prompt
@@ -328,7 +337,7 @@ async def query(request: Request, q: Query):
     async def event_stream() -> AsyncGenerator[bytes, None]:
         try:
             async for chunk in call_llm_stream(q.prompt):
-                if chunk is None:
+                if chunk is None or chunk == "":
                     continue
                 payload = {
                     "token": chunk,
@@ -336,11 +345,13 @@ async def query(request: Request, q: Query):
                     "request_id": request_id,
                 }
                 s = f"data: {json.dumps(payload)}\n\n"
+                # Log sent data
+                logger.debug("Sending token", token=chunk, request_id=request_id)
                 yield s.encode("utf-8")
         except Exception as e:
             logger.exception("Error during LLM streaming", error=str(e))
             err_payload = {"error": str(e), "request_id": request_id}
-            err = f"event: error\ndata: {json.dumps(err_payload)}\n\n"
+            err = f"data: {json.dumps(err_payload)}\n\n"
             yield err.encode("utf-8")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")

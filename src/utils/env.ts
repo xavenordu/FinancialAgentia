@@ -6,14 +6,14 @@ config({ quiet: true });
 
 // Map provider IDs to their required API key environment variable names
 const PROVIDER_API_KEY_MAP: Record<string, string> = {
-  'openai': 'OPENAI_API_KEY',
+  'openai': 'OPENAI_KEY',
   'anthropic': 'ANTHROPIC_API_KEY',
   'google': 'GOOGLE_API_KEY',
 };
 
 // Map model IDs to their required API key environment variable names (for backwards compatibility)
 const MODEL_API_KEY_MAP: Record<string, string> = {
-  'gpt-5.2': 'OPENAI_API_KEY',
+  'gpt-5.2': 'OPENAI_KEY',
   'claude-sonnet-4-5': 'ANTHROPIC_API_KEY',
   'gemini-3': 'GOOGLE_API_KEY',
 };

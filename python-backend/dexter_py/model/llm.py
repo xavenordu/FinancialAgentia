@@ -7,27 +7,27 @@ import os
 import asyncio
 import json
 from typing import Optional, Any, AsyncGenerator, Type
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_not_exception_type
+from openai import RateLimitError
 import pybreaker
 
 # Try to import langchain; if not available, we'll raise a helpful error at runtime.
 try:
-    from langchain.chat_models import ChatOpenAI
+    from langchain_openai import ChatOpenAI
     # Optional providers - may not be present in all langchain installs
     try:
-        from langchain.chat_models import ChatAnthropic  # type: ignore
+        from langchain_anthropic import ChatAnthropic  # type: ignore
     except Exception:
         ChatAnthropic = None  # type: ignore
     try:
-        from langchain.chat_models import ChatGoogleGenerativeAI  # type: ignore
+        from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
     except Exception:
         ChatGoogleGenerativeAI = None  # type: ignore
-    from langchain.schema import HumanMessage, SystemMessage
-except Exception:
-    ChatOpenAI = None  # type: ignore
-
+    from langchain_core.messages import HumanMessage, SystemMessage
+except ImportError:
+    pass
 DEFAULT_PROVIDER = "openai"
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MODEL = "gpt-3.5-turbo"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 
@@ -41,10 +41,12 @@ def get_chat_model(model_name: str = DEFAULT_MODEL, streaming: bool = False):
 
     # Provider mapping by model name prefix (matches TypeScript mapping)
     def default_factory(name: str, streaming_flag: bool):
+        if ChatOpenAI is None:
+            raise RuntimeError("langchain is required for the Python backend. Install from requirements.txt")
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not set in environment")
-        return ChatOpenAI(model_name=name, streaming=streaming_flag, openai_api_key=api_key)
+        return ChatOpenAI(model_name=name, openai_api_key=api_key)
 
     providers = {}
     if 'ChatAnthropic' in globals() and ChatAnthropic is not None:
@@ -100,30 +102,15 @@ async def call_llm(
     chat = get_chat_model(model_name, streaming=False)
 
     def _sync_call():
-        messages = [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
-        # Try predict_messages (returns message object), else predict (string)
-        if hasattr(chat, 'predict_messages'):
-            try:
-                return chat.predict_messages(messages)
-            except Exception:
-                pass
-        if hasattr(chat, 'predict'):
-            return chat.predict(prompt)
-        # Fallback to calling generate / create
-        if hasattr(chat, 'generate'):
-            # generate returns a Generation object; try to extract text
-            gen = chat.generate(messages)
-            try:
-                # Attempt to pull combined text
-                return ' '.join([c.output_text for r in gen.generations for c in r])
-            except Exception:
-                return str(gen)
-        raise RuntimeError('No supported call method on chat model')
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+        # Use invoke for non-streaming
+        result = chat.invoke(messages)
+        return result
 
     # Add retries and a circuit breaker around provider calls to improve resilience
     breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception_type(Exception))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_not_exception_type(RateLimitError))
     def _resilient_sync_call():
         # Use the circuit breaker to call the provider; pybreaker will raise on open circuit
         return breaker.call(_sync_call)
@@ -150,7 +137,7 @@ async def call_llm(
             except Exception as e:
                 raise RuntimeError(f'Failed to parse JSON from model output: {e}\nOutput was: {content}')
         # Use pydantic to validate/construct
-        return output_model.parse_obj(parsed)
+        return output_model.model_validate(parsed)
 
     return content
 
@@ -175,20 +162,17 @@ async def call_llm_stream(
     if hasattr(chat, 'stream'):
         # Best-effort: langchain stream APIs vary; attempt a common pattern
         try:
-            # Wrap the stream creation in a small resilient wrapper
-            breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
-
-            @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception_type(Exception))
-            def _get_stream():
-                return breaker.call(lambda: chat.stream([SystemMessage(content=system_prompt), HumanMessage(content=prompt)]))
-
-            stream = await asyncio.to_thread(_get_stream)
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+            stream = await asyncio.to_thread(lambda: chat.stream(messages))
             for chunk in stream:
                 # Each chunk may be a message-like object
-                if hasattr(chunk, 'content'):
-                    yield chunk.content
-                else:
-                    yield str(chunk)
+                try:
+                    if hasattr(chunk, 'content'):
+                        yield chunk.content
+                    else:
+                        yield str(chunk)
+                except AttributeError:
+                    yield f"Chunk error: {type(chunk)} {chunk}"
             return
         except Exception:
             # Fall through to single-chunk fallback

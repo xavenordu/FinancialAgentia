@@ -2,6 +2,7 @@ import { callLlmStream } from '../../model/llm.js';
 import { getFinalAnswerSystemPrompt, buildFinalAnswerUserPrompt } from '../prompts.js';
 import type { AnswerInput } from '../state.js';
 import type { ToolContextManager } from '../../utils/context.js';
+import type { MessageHistory } from '../../utils/message-history.js';
 
 // ============================================================================
 // Answer Phase Options
@@ -18,6 +19,7 @@ export interface AnswerPhaseOptions {
 
 /**
  * Generates the final answer from all task results across all iterations.
+ * Optionally includes conversation history for multi-turn context awareness.
  */
 export class AnswerPhase {
   private readonly model: string;
@@ -30,8 +32,9 @@ export class AnswerPhase {
 
   /**
    * Runs answer generation and returns a stream for the response.
+   * Includes conversation context if messageHistory is provided.
    */
-  run(input: AnswerInput): AsyncGenerator<string> {
+  async *run(input: AnswerInput): AsyncGenerator<string> {
     // Format task outputs from ALL plans
     const taskOutputs = input.completedPlans
       .flatMap(plan => plan.tasks)
@@ -57,15 +60,51 @@ export class AnswerPhase {
       ? sources.map(s => `${s.description}: ${s.urls.join(', ')}`).join('\n')
       : '';
 
-    // Build the final answer prompt
+    // Build conversation context if history is provided
+    let conversationContext = '';
+    if (input.messageHistory && input.messageHistory.hasMessages()) {
+      // Format relevant messages for context
+      const relevantMessages = await input.messageHistory.selectRelevantMessages(input.query);
+      if (relevantMessages.length > 0) {
+        conversationContext = input.messageHistory.formatForPlanning(relevantMessages);
+      }
+    }
+
+    // Build the final answer prompt with optional conversation context
     const systemPrompt = getFinalAnswerSystemPrompt();
-    const userPrompt = buildFinalAnswerUserPrompt(input.query, taskOutputs, sourcesStr);
+    const userPrompt = this.buildPromptWithContext(
+      input.query,
+      taskOutputs,
+      sourcesStr,
+      conversationContext
+    );
 
     // Return the stream
-    return callLlmStream(userPrompt, {
+    yield* callLlmStream(userPrompt, {
       systemPrompt,
       model: this.model,
     });
+  }
+
+  /**
+   * Builds the user prompt with optional conversation context.
+   */
+  private buildPromptWithContext(
+    query: string,
+    taskOutputs: string,
+    sourcesStr: string,
+    conversationContext: string
+  ): string {
+    const parts: string[] = [];
+
+    if (conversationContext) {
+      parts.push(conversationContext);
+      parts.push('\n\n---\n\n');
+    }
+
+    parts.push(buildFinalAnswerUserPrompt(query, taskOutputs, sourcesStr));
+
+    return parts.join('');
   }
 }
 

@@ -84,6 +84,9 @@ export class Agent {
   private readonly contextManager: ToolContextManager;
   private readonly maxIterations: number;
   
+  // Persistent conversation context maintained across runs
+  private readonly messageHistory: MessageHistory;
+  
   private readonly understandPhase: UnderstandPhase;
   private readonly planPhase: PlanPhase;
   private readonly executePhase: ExecutePhase;
@@ -96,6 +99,9 @@ export class Agent {
     this.callbacks = options.callbacks ?? {};
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     this.contextManager = new ToolContextManager('.dexter/context', this.model);
+
+    // Initialize persistent message history
+    this.messageHistory = new MessageHistory(this.model);
 
     // Initialize phases
     this.understandPhase = new UnderstandPhase({ model: this.model });
@@ -120,8 +126,16 @@ export class Agent {
 
   /**
    * Main entry point - runs the agent with iterative reflection.
+   * Maintains persistent conversation history across multiple runs.
+   * 
+   * @param query - User's query
+   * @param messageHistory - Optional external MessageHistory; uses internal if not provided
+   * @returns The final answer string
    */
   async run(query: string, messageHistory?: MessageHistory): Promise<string> {
+    // Use provided history or agent's persistent internal history
+    const history = messageHistory ?? this.messageHistory;
+    
     const taskResults: Map<string, TaskResult> = new Map();
     const completedPlans: Plan[] = [];
 
@@ -132,7 +146,7 @@ export class Agent {
     
     const understanding = await this.understandPhase.run({
       query,
-      conversationHistory: messageHistory,
+      conversationHistory: history,  // Pass history for context-aware understanding
     });
     
     this.callbacks.onUnderstandingComplete?.(understanding);
@@ -214,15 +228,35 @@ export class Agent {
     this.callbacks.onPhaseStart?.('answer');
     this.callbacks.onAnswerStart?.();
 
-    const stream = this.answerPhase.run({
+    const answerStream = this.answerPhase.run({
       query,
       completedPlans,
       taskResults,
+      messageHistory: history,  // Pass history for context-aware answer synthesis
     });
 
-    this.callbacks.onAnswerStream?.(stream);
+    this.callbacks.onAnswerStream?.(answerStream);
+    
+    // Collect the full answer for history tracking
+    let fullAnswer = '';
+    for await (const chunk of answerStream) {
+      fullAnswer += chunk;
+    }
+
+    // Add this turn to conversation history for future context
+    await history.addMessage(query, fullAnswer);
+
     this.callbacks.onPhaseComplete?.('answer');
 
-    return '';
+    return fullAnswer;
+  }
+
+  /**
+   * Returns the agent's persistent message history.
+   * Can be used to inspect previous conversations or passed to run() for external management.
+   */
+  getMessageHistory(): MessageHistory {
+    return this.messageHistory;
   }
 }
+

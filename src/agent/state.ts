@@ -211,4 +211,6 @@ export interface AnswerInput {
   query: string;
   completedPlans: Plan[];
   taskResults: Map<string, TaskResult>;
+  messageHistory?: MessageHistory;  // Optional conversation history for context-aware answering
 }
+

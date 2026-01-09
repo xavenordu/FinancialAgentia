@@ -1,46 +1,98 @@
-from typing import Optional, Any
-from ...model.llm import call_llm
+from typing import Optional, Any, AsyncGenerator
+from ...model.llm import call_llm_stream
 from .. import schemas
 from ..schemas import Understanding
+import json
+import re
 
 
 class UnderstandPhase:
-    """Ported UnderstandPhase: extracts intent and entities using the LLM.
-
-    This implementation mirrors the TypeScript behavior: it builds a system
-    prompt, optionally includes conversation context, and asks the model to
-    return a structured JSON matching `Understanding`.
+    """
+    UnderstandPhase (streaming): extracts intent and entities from a user query using the LLM,
+    with streaming support for partial processing.
     """
 
     def __init__(self, model: str) -> None:
         self.model = model
 
-    async def run(self, *, query: str, conversation_history: Optional[Any] = None) -> Understanding:
-        # Build conversation context if available
+    async def run(
+        self,
+        *,
+        query: str,
+        conversation_history: Optional[Any] = None
+    ) -> Understanding:
+        """
+        Run the understanding phase and return the final Understanding object.
+        """
+        # Collect streaming chunks into a buffer
+        collected_output = ""
+        async for chunk in self.stream(query=query, conversation_history=conversation_history):
+            collected_output += chunk
+
+        # Attempt to parse final JSON output from LLM
+        try:
+            # Clean up output in case LLM adds extraneous text
+            json_text = self._extract_json(collected_output)
+            return Understanding.parse_raw(json_text)
+        except Exception:
+            # Fallback to minimal understanding
+            return Understanding(intent=query, entities=[])
+
+    async def stream(
+        self,
+        *,
+        query: str,
+        conversation_history: Optional[Any] = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        Streaming version: yields LLM tokens as they arrive.
+        """
+        # ----------------------------
+        # 1. Build conversation context
+        # ----------------------------
         conversation_context: Optional[str] = None
-        if conversation_history is not None:
-            # Best-effort compatibility with the TS MessageHistory API
+        if conversation_history:
             try:
-                if hasattr(conversation_history, 'hasMessages') and conversation_history.hasMessages():
-                    relevant = await conversation_history.selectRelevantMessages(query)
-                    if relevant and hasattr(conversation_history, 'formatForPlanning'):
-                        conversation_context = conversation_history.formatForPlanning(relevant)
+                # Check if history has previous messages
+                if hasattr(conversation_history, 'has_messages') and conversation_history.has_messages():
+                    # Get relevant messages from history
+                    if hasattr(conversation_history, 'select_relevant_messages'):
+                        relevant_messages = await conversation_history.select_relevant_messages(query)
+                        if relevant_messages:
+                            # Format messages for inclusion in prompt
+                            if hasattr(conversation_history, 'format_for_planning'):
+                                conversation_context = conversation_history.format_for_planning(relevant_messages)
             except Exception:
-                # Fallback: ignore conversation history if methods differ
                 pass
 
-        # Import prompts lazily to avoid circular imports at module load
-        from .. import prompts as _prompts
+        # ----------------------------
+        # 2. Build prompts
+        # ----------------------------
+        try:
+            from .. import prompts as _prompts
+            system_prompt = _prompts.get_understand_system_prompt()
+            user_prompt = _prompts.build_understand_user_prompt(query, conversation_context)
+        except Exception:
+            system_prompt = "You are a financial research agent. Extract user intent and entities."
+            user_prompt = f"Analyze the query: {query}"
 
-        system_prompt = _prompts.getUnderstandSystemPrompt()
-        user_prompt = _prompts.buildUnderstandUserPrompt(query, conversation_context)
+        # ----------------------------
+        # 3. Stream LLM output
+        # ----------------------------
+        try:
+            async for token in call_llm_stream(prompt=user_prompt, model=self.model, system_prompt=system_prompt):
+                yield token
+        except Exception:
+            # Fallback: yield the query as intent
+            yield json.dumps({"intent": query, "entities": []})
 
-        # Call LLM with structured output (pydantic model)
-        result = await call_llm(user_prompt, model=self.model, system_prompt=system_prompt, output_model=schemas.Understanding)
-
-        # call_llm returns a pydantic model instance when output_model is provided
-        if isinstance(result, Understanding):
-            return result
-
-        # If for some reason it's a dict-like, coerce to the model
-        return Understanding.parse_obj(result)
+    def _extract_json(self, text: str) -> str:
+        """
+        Attempt to extract the first JSON object from the LLM output.
+        """
+        json_pattern = re.compile(r"\{.*\}", re.DOTALL)
+        match = json_pattern.search(text)
+        if match:
+            return match.group(0)
+        # Fallback: return minimal JSON
+        return json.dumps({"intent": text.strip(), "entities": []})

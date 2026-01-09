@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, AsyncGenerator
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
 from ..utils.context import ToolContextManager
@@ -18,17 +18,12 @@ DEFAULT_MAX_ITERATIONS = 5
 
 @dataclass
 class AgentCallbacks:
-    # Phase transitions
     on_phase_start: Optional[callable] = None
     on_phase_complete: Optional[callable] = None
-    # Understanding
     on_understanding_complete: Optional[callable] = None
-    # Planning
     on_plan_created: Optional[callable] = None
-    # Reflection
     on_reflection_complete: Optional[callable] = None
     on_iteration_start: Optional[callable] = None
-    # Answer
     on_answer_start: Optional[callable] = None
     on_answer_stream: Optional[callable] = None
 
@@ -41,11 +36,16 @@ class AgentOptions:
 
 
 class Agent:
-    """Agent - port of the TypeScript orchestrator.
+    """Agent - port of the TypeScript orchestrator with conversation context management.
 
-    This class wires phases, executors and context management together. The
-    concrete phase implementations are placeholders; we'll incrementally port
-    full behavior from the TypeScript source.
+    This class wires phases, executors and context management together, maintaining
+    conversation history across multiple queries for multi-turn interactions.
+    
+    Key features:
+    - Multi-phase execution: Understand → Plan → Execute → Reflect → Answer
+    - Persistent message history for multi-turn conversations
+    - Iterative refinement loop with reflection feedback
+    - Callback system for monitoring and UI updates
     """
 
     def __init__(self, options: AgentOptions) -> None:
@@ -53,17 +53,17 @@ class Agent:
         self.callbacks = options.callbacks or AgentCallbacks()
         self.max_iterations = options.max_iterations or DEFAULT_MAX_ITERATIONS
 
-        # Context manager (stub)
+        # Persistent conversation context maintained across queries
+        self.message_history = MessageHistory(model=self.model)
+
         self.context_manager = ToolContextManager('.dexter/context', self.model)
 
-        # Initialize phases
         self.understand_phase = UnderstandPhase(model=self.model)
         self.plan_phase = PlanPhase(model=self.model)
         self.execute_phase = ExecutePhase(model=self.model)
         self.reflect_phase = ReflectPhase(model=self.model, max_iterations=self.max_iterations)
         self.answer_phase = AnswerPhase(model=self.model, context_manager=self.context_manager)
 
-        # Executors
         tool_executor = ToolExecutor(tools=TOOLS, context_manager=self.context_manager)
 
         self.task_executor = TaskExecutor(
@@ -73,35 +73,63 @@ class Agent:
             context_manager=self.context_manager,
         )
 
+    def _safe_callback(self, callback, *args) -> None:
+        if callable(callback):
+            try:
+                callback(*args)
+            except Exception:
+                # Silent containment—callbacks should never interrupt control flow
+                pass
+
+    async def _safe_phase_run(self, phase, **kwargs) -> Any:
+        try:
+            return await phase.run(**kwargs)
+        except Exception as exc:
+            return {"error": str(exc), "failed": True}
+
     async def run(self, query: str, message_history: Optional[MessageHistory] = None) -> str:
+        """Run the agent with a query, maintaining persistent conversation context.
+        
+        If message_history is not provided, uses the agent's internal message_history.
+        Updates message_history with the answer upon completion.
+        
+        Args:
+            query: The user's query
+            message_history: Optional MessageHistory for multi-turn conversations
+            
+        Returns:
+            The final answer as a string
+        """
+        # Use provided history or agent's persistent history
+        history = message_history or self.message_history
+        
         task_results: Dict[str, Any] = {}
         completed_plans: List[dict] = []
 
-        # Phase 1: Understand
-        if callable(self.callbacks.on_phase_start):
-            self.callbacks.on_phase_start('understand')
+        self._safe_callback(self.callbacks.on_phase_start, 'understand')
 
-        understanding = await self.understand_phase.run(query=query, conversation_history=message_history)
+        # Phase 1: UNDERSTAND - Pass conversation context
+        understanding = await self._safe_phase_run(
+            self.understand_phase,
+            query=query,
+            conversation_history=history  # Pass history for context
+        )
 
-        if callable(self.callbacks.on_understanding_complete):
-            self.callbacks.on_understanding_complete(understanding)
+        self._safe_callback(self.callbacks.on_understanding_complete, understanding)
+        self._safe_callback(self.callbacks.on_phase_complete, 'understand')
 
-        if callable(self.callbacks.on_phase_complete):
-            self.callbacks.on_phase_complete('understand')
-
-        # Iterative Plan -> Execute -> Reflect loop
         iteration = 1
         guidance_from_reflection: Optional[str] = None
 
+        # Iterative Plan -> Execute -> Reflect loop
         while iteration <= self.max_iterations:
-            if callable(self.callbacks.on_iteration_start):
-                self.callbacks.on_iteration_start(iteration)
+            self._safe_callback(self.callbacks.on_iteration_start, iteration)
 
-            # Plan
-            if callable(self.callbacks.on_phase_start):
-                self.callbacks.on_phase_start('plan')
+            # Phase 2: PLAN
+            self._safe_callback(self.callbacks.on_phase_start, 'plan')
 
-            plan = await self.plan_phase.run(
+            plan = await self._safe_phase_run(
+                self.plan_phase,
                 query=query,
                 understanding=understanding,
                 prior_plans=completed_plans if completed_plans else None,
@@ -109,28 +137,35 @@ class Agent:
                 guidance_from_reflection=guidance_from_reflection,
             )
 
-            if callable(self.callbacks.on_plan_created):
-                self.callbacks.on_plan_created(plan, iteration)
+            self._safe_callback(self.callbacks.on_plan_created, plan, iteration)
+            self._safe_callback(self.callbacks.on_phase_complete, 'plan')
 
-            if callable(self.callbacks.on_phase_complete):
-                self.callbacks.on_phase_complete('plan')
+            # Phase 3: EXECUTE
+            self._safe_callback(self.callbacks.on_phase_start, 'execute')
 
-            # Execute
-            if callable(self.callbacks.on_phase_start):
-                self.callbacks.on_phase_start('execute')
+            try:
+                await self.task_executor.execute_tasks(
+                    query=query,
+                    plan=plan,
+                    understanding=understanding,
+                    task_results=task_results,
+                    callbacks=self.callbacks
+                )
+            except Exception as exc:
+                task_results[f"__executor_error_iter_{iteration}"] = {
+                    "error": str(exc),
+                    "failed": True,
+                }
 
-            await self.task_executor.execute_tasks(query, plan, understanding, task_results, self.callbacks)
-
-            if callable(self.callbacks.on_phase_complete):
-                self.callbacks.on_phase_complete('execute')
+            self._safe_callback(self.callbacks.on_phase_complete, 'execute')
 
             completed_plans.append(plan)
 
-            # Reflect
-            if callable(self.callbacks.on_phase_start):
-                self.callbacks.on_phase_start('reflect')
+            # Phase 4: REFLECT
+            self._safe_callback(self.callbacks.on_phase_start, 'reflect')
 
-            reflection = await self.reflect_phase.run(
+            reflection = await self._safe_phase_run(
+                self.reflect_phase,
                 query=query,
                 understanding=understanding,
                 completed_plans=completed_plans,
@@ -138,33 +173,48 @@ class Agent:
                 iteration=iteration,
             )
 
-            if callable(self.callbacks.on_reflection_complete):
-                self.callbacks.on_reflection_complete(reflection, iteration)
+            self._safe_callback(self.callbacks.on_reflection_complete, reflection, iteration)
+            self._safe_callback(self.callbacks.on_phase_complete, 'reflect')
 
-            if callable(self.callbacks.on_phase_complete):
-                self.callbacks.on_phase_complete('reflect')
-
-            if reflection.get('is_complete'):
+            # Stop condition: if reflection says we have enough data
+            if isinstance(reflection, dict) and reflection.get('is_complete'):
                 break
 
             guidance_from_reflection = self.reflect_phase.build_planning_guidance(reflection)
             iteration += 1
 
-        # Answer
-        if callable(self.callbacks.on_phase_start):
-            self.callbacks.on_phase_start('answer')
+        # Phase 5: ANSWER - Include conversation context
+        self._safe_callback(self.callbacks.on_phase_start, 'answer')
+        self._safe_callback(self.callbacks.on_answer_start)
 
-        if callable(self.callbacks.on_answer_start):
-            self.callbacks.on_answer_start()
+        stream = await self._safe_phase_run(
+            self.answer_phase,
+            query=query,
+            completed_plans=completed_plans,
+            task_results=task_results,
+            message_history=history,  # Pass history for context-aware answering
+        )
 
-        stream = await self.answer_phase.run(query=query, completed_plans=completed_plans, task_results=task_results)
+        # Collect the final answer from the stream
+        final_answer = ""
+        if isinstance(stream, str):
+            final_answer = stream
+        elif hasattr(stream, '__aiter__'):
+            # Async generator: collect all chunks
+            async for chunk in stream:
+                if isinstance(chunk, str):
+                    final_answer += chunk
 
         if callable(self.callbacks.on_answer_stream):
-            # Pass the async generator through
-            self.callbacks.on_answer_stream(stream)
+            try:
+                self.callbacks.on_answer_stream(stream)
+            except Exception:
+                pass
 
-        if callable(self.callbacks.on_phase_complete):
-            self.callbacks.on_phase_complete('answer')
+        # Update message history with the completed turn
+        # This allows future queries to reference this conversation
+        history.add_agent_message(query, final_answer)
 
-        # For compatibility with the TS version, return an empty string for now.
-        return ""
+        self._safe_callback(self.callbacks.on_phase_complete, 'answer')
+
+        return final_answer

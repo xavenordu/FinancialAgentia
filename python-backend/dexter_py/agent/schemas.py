@@ -1,72 +1,128 @@
-from __future__ import annotations
-from typing import List, Dict
+from typing import Optional, List, Dict, Any
 from enum import Enum
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
-class EntityType(str, Enum):
-    ticker = 'ticker'
-    date = 'date'
-    metric = 'metric'
-    company = 'company'
-    period = 'period'
-    other = 'other'
+# ---------- BASE ----------
+
+class StrictBase(BaseModel):
+    """Shared config enforcing stricter typing and serialization."""
+    model_config = {
+        "extra": "forbid",
+        "validate_assignment": True,
+        "use_enum_values": True,
+        "populate_by_name": True,
+    }
 
 
-class Entity(BaseModel):
-    type: EntityType
-    value: str
+# ---------- ENUMS ----------
+
+class PlanState(str, Enum):
+    PLANNING = "planning"
+    AWAITING_USER = "awaiting_user"
+    EXECUTING = "executing"
+    COMPLETE = "complete"
+    FAILED = "failed"
 
 
-class Understanding(BaseModel):
-    intent: str
-    entities: List[Entity]
+class StepType(str, Enum):
+    ACTION = "action"
+    SELECTION_REQUIRED = "selection_required"
+    CONFIRMATION_REQUIRED = "confirmation_required"
+    ERROR = "error"
 
 
-class TaskType(str, Enum):
-    use_tools = 'use_tools'
-    reason = 'reason'
+class ActionType(str, Enum):
+    TOOL = "tool"
+    TOOL_RESPONSE = "tool_response"
+    LLM = "llm"
 
 
-class TaskStatus(str, Enum):
-    pending = 'pending'
-    in_progress = 'in_progress'
-    completed = 'completed'
-    failed = 'failed'
+# ---------- CORE MODELS ----------
+
+class Step(StrictBase):
+    step_type: StepType = Field(description="Categorizes the step behavior for the UI.")
+    name: str = Field(description="Unique name identifier for the step.")
+    description: str = Field(description="Human-readable explanation of what the step does.")
+    action_type: Optional[ActionType] = Field(
+        None, description="The execution type associated with the step."
+    )
+
+    @field_validator("name")
+    def name_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Step name cannot be empty.")
+        return v
 
 
-class ToolCall(BaseModel):
-    tool: str
-    args: Dict[str, object]
+class ToolConfig(StrictBase):
+    useTool: str = Field(description="Name of the tool to invoke.")
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("useTool")
+    def tool_name_valid(cls, v):
+        if " " in v:
+            raise ValueError("Tool names must not contain spaces.")
+        return v
 
 
-class ToolCallStatus(ToolCall):
-    status: str  # 'pending' | 'running' | 'completed' | 'failed'
+class ActionInput(StrictBase):
+    type: str = Field(description="The action type descriptor string.")
+    input: Dict[str, Any] = Field(default_factory=dict)
+    tool: Optional[ToolConfig] = Field(
+        None,
+        description="Tool configuration if type references a TOOL action.",
+    )
 
 
-class PlanTask(BaseModel):
-    id: str
-    description: str
-    status: TaskStatus = TaskStatus.pending
-    taskType: TaskType | None = None
-    toolCalls: List[ToolCallStatus] = []
-    dependsOn: List[str] = []
+class ActionStep(StrictBase):
+    id: str = Field(description="Unique step identifier for execution tracking.")
+    name: str = Field(description="User-friendly name for the step.")
+    action_input: ActionInput = Field(description="Execution instructions for the step.")
 
 
-class Plan(BaseModel):
-    summary: str
-    tasks: List[PlanTask]
+class Plan(StrictBase):
+    plan_id: str = Field(description="Unique ID for the entire plan workflow.")
+    steps: List[Step] = Field(default_factory=list)
+    state: PlanState = PlanState.PLANNING
+    current_step: int = 0
+    errors: List[str] = Field(default_factory=list)
+
+    # --- Helpers ---
+
+    @property
+    def is_complete(self) -> bool:
+        return self.state == PlanState.COMPLETE
+
+    @property
+    def is_failed(self) -> bool:
+        return self.state == PlanState.FAILED
+
+    def next_step(self) -> Optional[Step]:
+        if self.current_step < len(self.steps):
+            return self.steps[self.current_step]
+        return None
+
+    def advance(self) -> None:
+        """Move to the next step safely."""
+        if self.is_complete:
+            raise RuntimeError("Cannot advance; plan already complete.")
+        self.current_step += 1
+        if self.current_step >= len(self.steps):
+            self.state = PlanState.COMPLETE
 
 
-class ReflectionResult(BaseModel):
-    isComplete: bool
-    reasoning: str
-    missingInfo: List[str]
-    suggestedNextSteps: str
+class ReadOnlyPlan(StrictBase):
+    plan: Plan
+    allow_partial: bool = False
 
 
-class ToolSummary(BaseModel):
-    id: str
-    toolName: str
-    args: Dict[str, object]
-    summary: str
+class PlanDict(StrictBase):
+    plan_id: str
+    steps: List[ActionStep]
+
+
+class ExecutionState(StrictBase):
+    execution_id: str
+    status: str
+    progress: Optional[str] = None

@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, AsyncGenerator, Iterable
+from typing import Any, AsyncGenerator, Iterable, Optional
 from ...model.llm import call_llm_stream
 import json
 import re

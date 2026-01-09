@@ -71,3 +71,68 @@ def build_understand_user_prompt(
     sections.append("Extract the intent and entities from this query.")
 
     return "\n".join(sections)
+
+
+PLAN_SYSTEM_PROMPT_TEMPLATE = (
+    "You are the planning component for Dexter, a financial research agent.\n\n"
+    "Your job is to create a structured plan for answering the user's query.\n"
+    "Break down the query into specific, actionable research tasks.\n\n"
+    "Current date: {current_date}\n\n"
+    "Guidelines:\n"
+    "- Create specific, actionable tasks that can be executed\n"
+    "- Identify data sources and tools needed (APIs, databases, etc.)\n"
+    "- Order tasks logically (dependencies matter)\n"
+    "- Include validation/verification steps\n"
+    "- Make tasks specific to financial research (tickers, metrics, periods)\n\n"
+    "Return a JSON object with:\n"
+    "  summary: Brief overview of the research plan\n"
+    "  tasks: Array of tasks with id, description, taskType, toolCalls, dependsOn\n"
+)
+
+
+def get_plan_system_prompt(date_override: Optional[str] = None) -> str:
+    """
+    Builds the planning system prompt with a safe date substitution.
+    Allows an optional date override for testing or reproducibility.
+    """
+    date_value = date_override or get_current_date()
+    return PLAN_SYSTEM_PROMPT_TEMPLATE.format(current_date=date_value)
+
+
+def build_plan_user_prompt(
+    query: str,
+    intent: str,
+    entities: str,
+    prior_work_summary: Optional[str] = None,
+    guidance_from_reflection: Optional[str] = None,
+    conversation_context: Optional[str] = None
+) -> str:
+    """
+    Builds the user prompt for the planning module.
+    Includes conversation context, prior work, and reflection guidance.
+    """
+    sections = []
+
+    if conversation_context:
+        sections.append(
+            "Previous conversation context:\n"
+            f"{conversation_context.strip()}\n\n"
+        )
+
+    sections.append(f"User Query: {query}\n")
+    sections.append(f"Intent: {intent}\n")
+    sections.append(f"Key Entities: {entities}\n")
+
+    if prior_work_summary:
+        sections.append(f"\nPrior Research Attempts:\n{prior_work_summary}\n")
+
+    if guidance_from_reflection:
+        sections.append(f"\nGuidance from Previous Iteration:\n{guidance_from_reflection}\n")
+
+    sections.append(
+        "\nCreate a detailed research plan that will help answer this query. "
+        "Include specific tools/APIs to use and the order of execution."
+    )
+
+    return "\n".join(sections)
+

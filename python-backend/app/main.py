@@ -1,8 +1,8 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 import os
 import json
 import uuid
@@ -27,6 +27,8 @@ from slowapi.errors import RateLimitExceeded
 from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 from ..dexter_py.model.llm import call_llm_stream
+from ..dexter_py.utils.session_store import get_session_store
+from ..dexter_py.agent.orchestrator import Orchestrator, AgentOptions
 
 
 # Configure structlog for JSON output
@@ -70,6 +72,18 @@ async def startup():
 
     # Initialize a deque to hold recent requests for dashboarding
     app.state.recent_requests = deque(maxlen=1000)
+    
+    # Initialize session store (in-memory or Redis based on env var)
+    app.state.session_store = get_session_store()
+    logger.info("Session store initialized", store=repr(app.state.session_store))
+    
+    # Initialize agent orchestrator
+    app.state.orchestrator = Orchestrator(
+        AgentOptions(
+            model=os.getenv("LLM_MODEL", "gpt-4"),
+        )
+    )
+    logger.info("Agent orchestrator initialized", model=os.getenv("LLM_MODEL", "gpt-4"))
 
 
 @app.on_event("shutdown")
@@ -356,3 +370,199 @@ async def query(request: Request, q: Query):
 
     return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")
 
+
+# ============================================================================
+# Session-based Agent Endpoints
+# ============================================================================
+
+class AgentQuery(BaseModel):
+    """Request body for agent query with session support."""
+    query: str
+    session_id: Optional[str] = None  # Auto-generated if not provided
+
+
+@app.post("/agent/query")
+@limiter.limit("10/minute")
+async def agent_query(request: Request, q: AgentQuery):
+    """Run agent query with session-based conversation context.
+    
+    Maintains conversation history per session using cookies or provided session ID.
+    Each request loads the session's message history, runs the agent with context,
+    and updates the store with the new turn.
+    
+    Query Parameters:
+    - session_id: Optional session ID (UUID). If not provided, generates new one.
+    
+    Returns:
+        SSE stream with agent response chunks
+    """
+    await require_auth(request)
+    
+    request_id = getattr(request.state, "request_id", None)
+    
+    # Determine session ID: from param, cookie, or generate new
+    session_id = q.session_id
+    if not session_id:
+        session_id = request.cookies.get("session_id")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+    
+    logger.info(
+        "Agent query received",
+        query=q.query[:200],
+        session_id=session_id,
+        request_id=request_id,
+    )
+    
+    # Get session store and orchestrator
+    session_store = getattr(app.state, "session_store", get_session_store())
+    orchestrator = getattr(app.state, "orchestrator")
+    
+    # Load message history from session
+    message_history = session_store.get(session_id)
+    
+    async def event_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            # Run agent with session context
+            final_answer = await orchestrator.run(
+                query=q.query,
+                message_history=message_history,
+                session_id=session_id,
+                session_store=session_store,
+            )
+            
+            # Stream the final answer
+            payload = {
+                "type": "answer",
+                "content": final_answer,
+                "session_id": session_id,
+                "request_id": request_id,
+            }
+            s = f"data: {json.dumps(payload)}\n\n"
+            logger.debug("Streaming agent answer", request_id=request_id)
+            yield s.encode("utf-8")
+            
+        except Exception as e:
+            logger.exception("Error during agent query", error=str(e), session_id=session_id)
+            err_payload = {
+                "type": "error",
+                "error": str(e),
+                "session_id": session_id,
+                "request_id": request_id,
+            }
+            err = f"data: {json.dumps(err_payload)}\n\n"
+            yield err.encode("utf-8")
+    
+    # Create response with session ID in cookie
+    response = StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")
+    response.set_cookie(
+        key="session_id",
+        value=session_id,
+        max_age=86400,  # 24 hours
+        secure=os.getenv("SECURE_COOKIES", "false").lower() == "true",
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/agent/history")
+async def get_history(request: Request, session_id: Optional[str] = None):
+    """Get conversation history for a session.
+    
+    Query Parameters:
+    - session_id: Optional session ID (defaults to cookie)
+    
+    Returns:
+        JSON with conversation history, turns count, and model info
+    """
+    await require_auth(request)
+    
+    # Determine session ID
+    session_id = session_id or request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    
+    session_store = getattr(app.state, "session_store", get_session_store())
+    history = session_store.get(session_id)
+    
+    if not history.has_messages():
+        return JSONResponse({
+            "session_id": session_id,
+            "turns": 0,
+            "messages": [],
+        })
+    
+    messages = [
+        {
+            "id": msg.id,
+            "query": msg.query,
+            "answer": msg.answer[:500],  # Truncate for preview
+            "summary": msg.summary,
+        }
+        for msg in history.get_all()
+    ]
+    
+    return JSONResponse({
+        "session_id": session_id,
+        "turns": len(history),
+        "messages": messages,
+        "model": history._model,
+    })
+
+
+@app.delete("/agent/history")
+async def clear_history(request: Request, session_id: Optional[str] = None):
+    """Clear conversation history for a session.
+    
+    Query Parameters:
+    - session_id: Optional session ID (defaults to cookie)
+    
+    Returns:
+        JSON confirming deletion
+    """
+    await require_auth(request)
+    
+    # Determine session ID
+    session_id = session_id or request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    
+    session_store = getattr(app.state, "session_store", get_session_store())
+    session_store.delete(session_id)
+    
+    logger.info("Session history cleared", session_id=session_id)
+    
+    return JSONResponse({
+        "session_id": session_id,
+        "status": "cleared",
+    })
+
+
+@app.post("/agent/session")
+async def create_session(request: Request):
+    """Create a new session and return the session ID.
+    
+    Useful for explicit session creation before first query.
+    
+    Returns:
+        JSON with new session ID and cookie
+    """
+    await require_auth(request)
+    
+    session_id = str(uuid.uuid4())
+    logger.info("New session created", session_id=session_id)
+    
+    response = JSONResponse({
+        "session_id": session_id,
+        "status": "created",
+    })
+    response.set_cookie(
+        key="session_id",
+        value=session_id,
+        max_age=86400,
+        secure=os.getenv("SECURE_COOKIES", "false").lower() == "true",
+        httponly=True,
+        samesite="lax",
+    )
+    return response

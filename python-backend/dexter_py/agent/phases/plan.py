@@ -28,6 +28,7 @@ class PlanPhase:
         prior_plans: Optional[List[Plan]] = None,
         prior_results: Optional[dict] = None,
         guidance_from_reflection: Optional[str] = None,
+        conversation_history: Optional[Any] = None,
     ) -> Plan:
         """
         Generate a final Plan object by collecting streamed LLM tokens.
@@ -39,7 +40,8 @@ class PlanPhase:
             understanding=understanding,
             prior_plans=prior_plans,
             prior_results=prior_results,
-            guidance_from_reflection=guidance_from_reflection
+            guidance_from_reflection=guidance_from_reflection,
+            conversation_history=conversation_history,
         ):
             collected_output += token
 
@@ -79,11 +81,27 @@ class PlanPhase:
         understanding: Any,
         prior_plans: Optional[List[Plan]] = None,
         prior_results: Optional[dict] = None,
-        guidance_from_reflection: Optional[str] = None
+        guidance_from_reflection: Optional[str] = None,
+        conversation_history: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Streaming version: yields tokens from the LLM as they arrive.
         """
+        # ----------------------------
+        # Build conversation context
+        # ----------------------------
+        conversation_context: Optional[str] = None
+        if conversation_history:
+            try:
+                if hasattr(conversation_history, 'has_messages') and conversation_history.has_messages():
+                    if hasattr(conversation_history, 'select_relevant_messages'):
+                        relevant_messages = await conversation_history.select_relevant_messages(query)
+                        if relevant_messages:
+                            if hasattr(conversation_history, 'format_for_planning'):
+                                conversation_context = conversation_history.format_for_planning(relevant_messages)
+            except Exception:
+                pass
+
         # ----------------------------
         # Extract entities
         # ----------------------------
@@ -102,13 +120,14 @@ class PlanPhase:
         # ----------------------------
         try:
             from .. import prompts as _prompts
-            system_prompt = _prompts.getPlanSystemPrompt()
-            user_prompt = _prompts.buildPlanUserPrompt(
+            system_prompt = _prompts.get_plan_system_prompt()
+            user_prompt = _prompts.build_plan_user_prompt(
                 query=query,
                 intent=getattr(understanding, "intent", ""),
                 entities=entities_str,
                 prior_work_summary=prior_work_summary,
                 guidance_from_reflection=guidance_from_reflection,
+                conversation_context=conversation_context,
             )
         except Exception:
             system_prompt = "You are a financial research assistant."

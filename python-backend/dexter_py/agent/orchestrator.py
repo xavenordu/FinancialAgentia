@@ -35,8 +35,8 @@ class AgentOptions:
     max_iterations: Optional[int] = None
 
 
-class Agent:
-    """Agent - port of the TypeScript orchestrator with conversation context management.
+class Orchestrator:
+    """Orchestrator - port of the TypeScript orchestrator with conversation context management.
 
     This class wires phases, executors and context management together, maintaining
     conversation history across multiple queries for multi-turn interactions.
@@ -87,21 +87,35 @@ class Agent:
         except Exception as exc:
             return {"error": str(exc), "failed": True}
 
-    async def run(self, query: str, message_history: Optional[MessageHistory] = None) -> str:
+    async def run(
+        self,
+        query: str,
+        message_history: Optional[MessageHistory] = None,
+        session_id: Optional[str] = None,
+        session_store: Optional[dict] = None,
+    ) -> str:
         """Run the agent with a query, maintaining persistent conversation context.
         
-        If message_history is not provided, uses the agent's internal message_history.
-        Updates message_history with the answer upon completion.
+        If session_id and session_store are provided, uses session-based history.
+        Otherwise, uses provided message_history or agent's internal message_history.
+        Updates message_history with the answer upon completion and syncs to session store.
         
         Args:
             query: The user's query
             message_history: Optional MessageHistory for multi-turn conversations
+            session_id: Optional session ID for session store management
+            session_store: Optional dict-like session store (Redis, in-memory, etc.)
             
         Returns:
             The final answer as a string
         """
-        # Use provided history or agent's persistent history
-        history = message_history or self.message_history
+        # Determine which history to use
+        if session_id and session_store:
+            # Fetch history from session store or create new
+            history = session_store.get(session_id, MessageHistory(model=self.model))
+        else:
+            # Use provided history or agent's persistent history
+            history = message_history or self.message_history
         
         task_results: Dict[str, Any] = {}
         completed_plans: List[dict] = []
@@ -135,6 +149,7 @@ class Agent:
                 prior_plans=completed_plans if completed_plans else None,
                 prior_results=task_results if task_results else None,
                 guidance_from_reflection=guidance_from_reflection,
+                conversation_history=history,  # Pass history for context-aware planning
             )
 
             self._safe_callback(self.callbacks.on_plan_created, plan, iteration)
@@ -214,6 +229,10 @@ class Agent:
         # Update message history with the completed turn
         # This allows future queries to reference this conversation
         history.add_agent_message(query, final_answer)
+        
+        # Sync back to session store if provided
+        if session_id and session_store:
+            session_store[session_id] = history
 
         self._safe_callback(self.callbacks.on_phase_complete, 'answer')
 

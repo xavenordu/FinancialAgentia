@@ -40,6 +40,15 @@ class ActionType(str, Enum):
 
 # ---------- CORE MODELS ----------
 
+class Understanding(StrictBase):
+    """Extracted understanding from user query (intent + entities)."""
+    intent: str = Field(description="The identified user intent from the query.")
+    entities: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Extracted entities relevant to the query (e.g., tickers, time periods)."
+    )
+
+
 class Step(StrictBase):
     step_type: StepType = Field(description="Categorizes the step behavior for the UI.")
     name: str = Field(description="Unique name identifier for the step.")
@@ -87,6 +96,8 @@ class Plan(StrictBase):
     state: PlanState = PlanState.PLANNING
     current_step: int = 0
     errors: List[str] = Field(default_factory=list)
+    summary: Optional[str] = Field(None, description="One sentence summary of the plan.")
+    tasks: List['PlanTask'] = Field(default_factory=list, description="List of tasks in the plan.")
 
     # --- Helpers ---
 
@@ -112,6 +123,16 @@ class Plan(StrictBase):
             self.state = PlanState.COMPLETE
 
 
+class PlanTask(StrictBase):
+    """A single task within a plan."""
+    id: str = Field(description="Unique task identifier (e.g., 'task_1').")
+    description: str = Field(description="Short task description (under 10 words).")
+    taskType: Optional[str] = Field(None, description="Task type: 'use_tools' or 'reason'.")
+    status: Optional[str] = Field(None, description="Task status: pending, running, complete, failed.")
+    dependsOn: List[str] = Field(default_factory=list, description="IDs of tasks this depends on.")
+    toolCalls: List[Dict[str, Any]] = Field(default_factory=list, description="Tool calls made by this task.")
+
+
 class ReadOnlyPlan(StrictBase):
     plan: Plan
     allow_partial: bool = False
@@ -126,3 +147,6 @@ class ExecutionState(StrictBase):
     execution_id: str
     status: str
     progress: Optional[str] = None
+
+# Update forward references for Pydantic
+Plan.model_rebuild()

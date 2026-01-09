@@ -53,15 +53,15 @@ class UnderstandPhase:
         conversation_context: Optional[str] = None
         if conversation_history:
             try:
-                has_messages = getattr(conversation_history, "hasMessages", lambda: False)()
-                if has_messages:
-                    select_relevant = getattr(conversation_history, "selectRelevantMessages", None)
-                    if callable(select_relevant):
-                        relevant = await select_relevant(query)
-                        if relevant:
-                            format_for_planning = getattr(conversation_history, "formatForPlanning", None)
-                            if callable(format_for_planning):
-                                conversation_context = format_for_planning(relevant)
+                # Check if history has previous messages
+                if hasattr(conversation_history, 'has_messages') and conversation_history.has_messages():
+                    # Get relevant messages from history
+                    if hasattr(conversation_history, 'select_relevant_messages'):
+                        relevant_messages = await conversation_history.select_relevant_messages(query)
+                        if relevant_messages:
+                            # Format messages for inclusion in prompt
+                            if hasattr(conversation_history, 'format_for_planning'):
+                                conversation_context = conversation_history.format_for_planning(relevant_messages)
             except Exception:
                 pass
 
@@ -70,8 +70,8 @@ class UnderstandPhase:
         # ----------------------------
         try:
             from .. import prompts as _prompts
-            system_prompt = _prompts.getUnderstandSystemPrompt()
-            user_prompt = _prompts.buildUnderstandUserPrompt(query, conversation_context)
+            system_prompt = _prompts.get_understand_system_prompt()
+            user_prompt = _prompts.build_understand_user_prompt(query, conversation_context)
         except Exception:
             system_prompt = "You are a financial research agent. Extract user intent and entities."
             user_prompt = f"Analyze the query: {query}"

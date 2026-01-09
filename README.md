@@ -1,310 +1,754 @@
-Dexter — Autonomous Financial Research Agent (TypeScript + Python)
+# FinancialAgentia
 
-This repository contains Dexter, an AI agent for structured financial research. It combines a TypeScript terminal UI (Ink) with a Python FastAPI backend (a port-in-progress of the original agent logic). The backend uses pydantic and LangChain for LLM integration and exposes a streaming endpoint the UI consumes.
+An autonomous AI-powered financial research agent that conducts deep, methodical analysis of stocks and companies. FinancialAgentia leverages multi-phase reasoning, iterative planning, and comprehensive financial data tools to answer complex financial questions with accuracy and depth.
 
-This README explains how to set up the project for development, run the frontend and backend, run the tests, and deploy a basic production-ready configuration.
-
----
-
-## Project layout (high level)
-
-- `src/` — TypeScript Ink terminal UI and React components. This remains the interactive client.
-- `python-backend/` — Python FastAPI backend with the ported agent logic and LLM wrapper.
-  - `python-backend/app/main.py` — FastAPI entrypoint; streaming `/query` endpoint using SSE
-  - `python-backend/dexter_py/` — Python package containing the agent port (schemas, orchestrator, phases)
-  - `python-backend/requirements.txt` — Python dependencies for the backend
-  - `python-backend/tests/` — pytest tests for backend endpoints
-- `env.example` / `python-backend/.env.example` — example env vars (API keys and backend API key)
+**Status**: Dual-stack implementation (TypeScript primary, Python backend port in progress)
 
 ---
 
-## Design decisions & goals
+## Table of Contents
 
-- Keep the TypeScript Ink UI to preserve the terminal UX while porting backend logic incrementally to Python.
-- Use FastAPI + SSE (Server-Sent Events) for robust streaming from the LLM to the UI.
-- Use pydantic models in Python to mirror TypeScript schemas (structured LLM outputs, plans, state).
-- Support multiple LLM providers (OpenAI by default; Anthropic / Google optionally) using LangChain when installed.
-- Make the backend production-friendly: optional `BACKEND_API_KEY`, logging, readiness endpoint, and tests.
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Features](#features)
+- [Installation & Setup](#installation--setup)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Development](#development)
+- [API Reference](#api-reference)
+- [Financial Tools](#financial-tools)
+- [Contributing](#contributing)
 
 ---
 
-## Prerequisites
+## Overview
 
-- Python 3.10+
-- Node/Bun environment for the TypeScript frontend (the repo uses `bun` in `package.json` but `node` may also be used if you adapt the scripts).
-- API keys:
-  - `OPENAI_API_KEY` (required to call OpenAI)
-  - `ANTHROPIC_API_KEY` (optional)
-  - `GOOGLE_API_KEY` (optional)
-  - `BACKEND_API_KEY` (optional; if set the backend requires requests to include `X-API-Key: <value>`)
+FinancialAgentia is a specialized AI agent designed for financial research. It breaks down complex financial questions into manageable research tasks, executes them strategically using a suite of financial data tools, and synthesizes comprehensive answers.
 
-Install Python dependencies (backend):
+### Key Capabilities
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r python-backend\requirements.txt
-# Also install langchain & SDKs for provider support:
-python -m pip install langchain openai
-# Optional providers:
-python -m pip install anthropic google-generative-ai
+- **Multi-phase reasoning**: Understand → Plan → Execute → Reflect → Answer
+- **Iterative refinement**: Reflection loop validates whether sufficient data has been gathered
+- **Just-in-time tool selection**: Tools are selected dynamically at execution time based on task requirements
+- **Contextual awareness**: Maintains conversation history for multi-turn interactions
+- **Streaming responses**: Supports real-time streaming of analysis results
+- **Rate limiting & resilience**: Built-in retry logic, circuit breakers, and rate limit handling
+
+### Supported Models
+
+- **OpenAI** (GPT-4, GPT-3.5-turbo, etc.)
+- **Anthropic Claude** (Claude 3 family)
+- **Google Gemini**
+- **Ollama** (local or cloud-hosted)
+
+---
+
+## Architecture
+
+### Phase-Based Execution Model
+
+FinancialAgentia executes through a well-defined multi-phase pipeline:
+
+```
+┌─────────────────┐
+│  1. UNDERSTAND  │  Extract intent & entities from user query
+└────────┬────────┘
+         │
+    ┌────▼────┐
+    │ Iterate │
+    │ Loop    │
+    │         │
+    ├────┬────┤
+    │ 2. PLAN    │  Create task list with dependencies
+    ├────┬────┤
+    │ 3. EXECUTE │  Run tasks with just-in-time tool selection
+    ├────┬────┤
+    │ 4. REFLECT │  Evaluate data sufficiency & decide on next iteration
+    └────┬────┘
+         │
+    ┌────▼──────────┐
+    │ 5. ANSWER      │  Synthesize final response from all results
+    └────────────────┘
 ```
 
-Install frontend dependencies (if using Bun):
+### Phase Details
+
+#### 1. **Understand Phase**
+- Analyzes the user's query in context of conversation history
+- Extracts intent: What does the user want to accomplish?
+- Identifies entities: Ticker symbols, companies, dates, metrics, time periods
+- Normalizes company names to ticker symbols (e.g., "Apple" → "AAPL")
+- Returns structured `Understanding` object with intent and entity list
+
+#### 2. **Plan Phase**
+- Creates a structured task list based on the query intent
+- Defines task types: `use_tools` (call financial data tools) or `reason` (analytical reasoning)
+- Establishes task dependencies for parallel execution
+- Incorporates reflection feedback from previous iterations
+- Generates unique task IDs to avoid collisions across multiple plan iterations
+
+#### 3. **Execute Phase**
+- Executes planned tasks sequentially or in parallel based on dependencies
+- For `use_tools` tasks: Selects appropriate financial tools and calls them
+- For `reason` tasks: Calls the LLM for analytical reasoning
+- Collects results from each task
+- Streams progress updates for UI feedback
+
+#### 4. **Reflect Phase**
+- Evaluates whether sufficient data has been gathered
+- Determines if another iteration is needed
+- Provides guidance to the next planning iteration
+- Prevents excessive iterations (configurable max iterations, default: 5)
+- Returns reflection results with confidence scores
+
+#### 5. **Answer Phase**
+- Synthesizes a comprehensive answer from all task results
+- Uses conversation context and tool results as evidence
+- Streams the response back to the user
+- Includes source citations and data references
+
+---
+
+## Project Structure
+
+```
+FinancialAgentia/
+├── src/                           # TypeScript/React frontend & agent
+│   ├── index.tsx                  # Entry point
+│   ├── cli.tsx                    # CLI interface using Ink (React for terminal)
+│   ├── theme.ts                   # Theme configuration
+│   │
+│   ├── agent/                     # Agent orchestration & phases
+│   │   ├── orchestrator.ts        # Main agent class
+│   │   ├── state.ts               # Type definitions
+│   │   ├── schemas.ts             # Zod validation schemas
+│   │   ├── prompts.ts             # System & user prompts
+│   │   ├── task-executor.ts       # Task execution logic
+│   │   ├── tool-executor.ts       # Tool invocation logic
+│   │   └── phases/                # Phase implementations
+│   │       ├── understand.ts
+│   │       ├── plan.ts
+│   │       ├── execute.ts
+│   │       ├── reflect.ts
+│   │       └── answer.ts
+│   │
+│   ├── model/                     # LLM integration
+│   │   └── llm.ts                 # Multi-provider LLM wrapper
+│   │
+│   ├── tools/                     # Tool implementations
+│   │   ├── index.ts               # Tool registry
+│   │   ├── types.ts               # Tool type definitions
+│   │   └── finance/               # Financial data tools
+│   │       ├── api.ts             # API client
+│   │       ├── fundamentals.ts    # Income statements, balance sheets, cash flows
+│   │       ├── filings.ts         # SEC filings (10-K, 10-Q, 8-K)
+│   │       ├── prices.ts          # Historical & current prices
+│   │       ├── metrics.ts         # Financial metrics (P/E, ROE, etc.)
+│   │       ├── news.ts            # Company news
+│   │       ├── estimates.ts       # Analyst estimates & targets
+│   │       ├── segments.ts        # Business segment data
+│   │       ├── crypto.ts          # Cryptocurrency prices
+│   │       ├── insider_trades.ts  # Insider trading data
+│   │       └── constants.ts       # API constants
+│   │
+│   ├── components/                # React/Ink UI components
+│   │   ├── Intro.tsx              # Welcome screen
+│   │   ├── Input.tsx              # User input handler
+│   │   ├── AnswerBox.tsx          # Answer display
+│   │   ├── ModelSelector.tsx      # Model selection UI
+│   │   ├── ApiKeyPrompt.tsx       # API key input
+│   │   ├── QueueDisplay.tsx       # Query queue display
+│   │   ├── AgentProgressView.tsx  # Progress tracking
+│   │   ├── TaskListView.tsx       # Task list display
+│   │   ├── StatusMessage.tsx      # Status updates
+│   │   └── index.ts               # Component exports
+│   │
+│   ├── hooks/                     # React hooks
+│   │   ├── useAgentExecution.ts   # Agent execution logic
+│   │   ├── useApiKey.ts           # API key management
+│   │   └── useQueryQueue.ts       # Query queue management
+│   │
+│   ├── utils/                     # Utilities
+│   │   ├── config.ts              # Config management
+│   │   ├── context.ts             # Tool context management
+│   │   ├── env.ts                 # Environment variable helpers
+│   │   ├── message-history.ts     # Conversation history
+│   │   └── index.ts               # Utility exports
+│   │
+│   └── cli/                       # CLI-specific types
+│       └── types.ts
+│
+├── python-backend/                # Python backend (port in progress)
+│   ├── app/                       # FastAPI application
+│   │   └── main.py                # FastAPI server with endpoints
+│   │
+│   ├── dexter_py/                 # Python agent implementation
+│   │   ├── __init__.py
+│   │   ├── file_reader.py         # File I/O utilities
+│   │   │
+│   │   ├── model/                 # LLM integration
+│   │   │   └── llm.py             # Multi-provider LLM wrapper
+│   │   │
+│   │   ├── agent/                 # Agent orchestration
+│   │   │   ├── orchestrator.py    # Main agent class
+│   │   │   ├── state.py           # State types
+│   │   │   ├── schemas.py         # Pydantic models
+│   │   │   ├── prompts.py         # System prompts
+│   │   │   ├── task_executor.py   # Task execution
+│   │   │   ├── tool_executor.py   # Tool invocation
+│   │   │   └── phases/            # Phase implementations
+│   │   │       ├── understand.py
+│   │   │       ├── plan.py
+│   │   │       ├── execute.py
+│   │   │       ├── reflect.py
+│   │   │       └── answer.py
+│   │   │
+│   │   ├── tools/                 # Tool registry
+│   │   │   └── __init__.py        # Empty tools list (to be ported)
+│   │   │
+│   │   ├── utils/                 # Utilities
+│   │   │   ├── context.py         # Tool context manager
+│   │   │   └── message_history.py # Conversation history
+│   │   │
+│   │   └── __pycache__/
+│   │
+│   ├── tests/                     # Unit tests
+│   │   ├── test_api.py
+│   │   ├── test_backend.py
+│   │   └── test_llm.py
+│   │
+│   ├── cli.py                     # CLI entry point (Typer)
+│   ├── requirements.txt           # Python dependencies
+│   ├── pyproject.toml             # Project metadata
+│   ├── README.md                  # Backend-specific README
+│   └── python_backend_logging.py  # Logging configuration
+│
+├── package.json                   # Node.js dependencies (TypeScript/React)
+├── tsconfig.json                  # TypeScript configuration
+├── jest.config.js                 # Jest testing configuration
+├── env.example                    # Example environment variables
+├── .env                           # Local environment variables (git-ignored)
+└── bun.lock                       # Bun lock file
+
+```
+
+---
+
+## Features
+
+### Agent Capabilities
+
+- **Query Understanding**: Extracts intent and entities from natural language queries
+- **Multi-turn Conversations**: Maintains context across multiple queries
+- **Intelligent Planning**: Creates task lists with proper dependencies and typing
+- **Tool Integration**: Seamlessly integrates financial data tools into execution
+- **Iterative Refinement**: Reflects on results and iterates until sufficient data is gathered
+- **Streaming Responses**: Real-time answer streaming with progress updates
+- **Error Recovery**: Graceful handling of tool failures with retry logic
+
+### Financial Data Coverage
+
+The agent can analyze:
+- **Fundamentals**: Income statements, balance sheets, cash flow statements
+- **Pricing**: Historical prices, technical analysis, price targets
+- **Filings**: SEC filings (10-K, 10-Q, 8-K, S-1, etc.)
+- **Metrics**: P/E ratios, ROE, ROA, debt ratios, growth metrics
+- **News**: Company news, earnings releases, events
+- **Estimates**: Analyst estimates, price targets, earnings surprises
+- **Segments**: Business segment performance and revenue breakdown
+- **Crypto**: Cryptocurrency prices and market data
+- **Insider Trading**: Insider buy/sell activity and holdings
+
+---
+
+## Installation & Setup
+
+### Prerequisites
+
+- **Node.js** 18+ or **Bun** (TypeScript/frontend)
+- **Python** 3.10+ (Python backend)
+- API keys for at least one supported LLM provider:
+  - `OPENAI_API_KEY` for OpenAI models
+  - `ANTHROPIC_API_KEY` for Claude models
+  - `GOOGLE_API_KEY` for Google Gemini
+  - `OLLAMA_API_KEY` for Ollama (cloud) or local Ollama instance
+
+### TypeScript/Frontend Setup
 
 ```bash
-# from repository root
+# Install dependencies (using Bun)
 bun install
-```
 
-If you don't want Bun, run the TypeScript build using your preferred Node toolchain (adjust scripts accordingly).
+# Or using npm
+npm install
 
----
-
-## Environment variables
-
-Copy the example env file and fill in your keys:
-
-```powershell
+# Create .env file with API keys
 cp env.example .env
-cp python-backend/.env.example python-backend/.env
-# Edit both .env files and add your keys
-```
+# Edit .env with your API keys
 
-Important variables:
-- `OPENAI_API_KEY` — OpenAI API key
-- `ANTHROPIC_API_KEY` — Anthropic API key (optional)
-- `GOOGLE_API_KEY` — Google GenAI key (optional)
-- `BACKEND_API_KEY` — Optional simple auth for the Python backend; if set, clients must send the header `X-API-Key: <value>`
-
-Secrets & Authentication (recommended):
-
-- Do not store secrets in files in Git. Prefer a secrets manager such as AWS Secrets Manager, Azure Key Vault, or HashiCorp Vault for production. On CI providers you can add them as encrypted secrets.
-- The Python backend supports two modes:
-  - JWT-based tokens: set `JWT_SECRET` (HS256) and issue short-lived JWTs to clients. The backend will validate `Authorization: Bearer <token>` headers.
-  - Legacy API key: keep `BACKEND_API_KEY` for simple local/test setups. When `JWT_SECRET` is set the backend will prefer JWT validation.
-- Example (local): use an environment injection mechanism or a local secrets tool rather than committing keys. For example, with AWS Secrets Manager you can retrieve secrets at startup and populate environment variables in your deployment manifest.
-
----
-
-## Running the backend (FastAPI)
-
-Start the Python backend locally (development):
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m uvicorn python-backend.app.main:app --reload
-```
-
-Endpoints:
-- `GET /health` — basic health check
-- `GET /ready` — readiness check (extend to probe provider connectivity)
-- `POST /query` — streaming LLM response using SSE (`text/event-stream`). The request body is JSON: `{ "prompt": "..." }`.
-  - If `BACKEND_API_KEY` is set, include header `X-API-Key: <value>` (case-insensitive).
-
-The backend uses `call_llm_stream` in `python-backend/dexter_py/model/llm.py` to stream text from the LLM. If the installed LangChain provider supports streaming, tokens are emitted incrementally. The backend frames each chunk as an SSE `data:` event.
-
----
-
-## Running the frontend (Ink TUI)
-
-The Ink TUI is in `src/`. By default the frontend posts prompts to `http://localhost:8000/query` and consumes the response stream. To start the frontend using Bun:
-
-```powershell
+# Run the CLI
 bun run src/index.tsx
+
+# Or in development mode with auto-reload
+bun --watch run src/index.tsx
+
+# Type checking
+bun run typecheck
+
+# Testing
+bun test
 ```
 
-If you set `BACKEND_API_KEY`, you must ensure the frontend sends the `X-API-Key` header with the same value. You can either export that header in your shell, or modify the frontend to include it in requests; the code can be updated to automatically include the header from environment variables.
+### Python Backend Setup
+
+```bash
+# Navigate to backend directory
+cd python-backend
+
+# Create virtual environment
+python -m venv .venv
+
+# Activate virtual environment
+# On Windows:
+.venv\Scripts\Activate.ps1
+# On macOS/Linux:
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Create .env file in project root
+cp ..env.example ../.env
+# Edit with your API keys
+
+# Run the FastAPI server
+python -m uvicorn app.main:app --reload
+
+# Or use the CLI
+python cli.py ask "What is the date today?"
+```
 
 ---
 
-## Tests
+## Usage
 
-Backend tests live in `python-backend/tests/` and use pytest + FastAPI TestClient. They mock the LLM stream to verify SSE framing and API key handling.
+### CLI Interface (TypeScript)
 
-Run tests:
+```bash
+# Start the interactive CLI
+bun run src/index.tsx
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pytest python-backend\tests -q
+# The CLI will:
+# 1. Show an introduction
+# 2. Prompt for model selection
+# 3. Verify API keys
+# 4. Accept user queries
+# 5. Display real-time progress as the agent researches
+# 6. Show final answer with sources
+```
+
+### CLI Commands (Python)
+
+```bash
+# Ask a simple question
+python cli.py ask "What is the P/E ratio of Apple?"
+
+# The response will use the configured LLM (default: local Ollama)
+```
+
+### API Endpoints (Python Backend)
+
+#### POST `/chat`
+Stream a financial analysis query.
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What are the key metrics for AAPL?"}' \
+  --no-buffer
+```
+
+Response: Server-sent events stream with progress updates and final answer.
+
+#### GET `/health`
+Health check endpoint.
+
+```bash
+curl http://localhost:8000/health
 ```
 
 ---
 
-## Production considerations & recommended improvements
+## Configuration
 
-This repo includes several production-ready improvements, but here are recommended next steps to harden a production deployment:
+### Environment Variables
 
-- Use a robust secrets manager for API keys (do not store keys in files). Use environment variables or a secrets store.
-- Add a proper authentication/authorization layer (API tokens, OAuth) instead of a single `BACKEND_API_KEY`.
-- Use SSE JSON events (e.g., `data: {"token":"...","role":"assistant"}`) to include metadata per token.
-- Add rate limiting and request quotas to protect the backend from abuse.
-- Add retries and backoff for provider calls and circuit breaker for provider outages.
-- Add structured logs (JSON), request IDs, and integrate with observability (Prometheus, OpenTelemetry).
-- Add CI tests for the TypeScript frontend (typecheck, lint, unit tests) and Python side (pytest + mypy).
-- Containerize the backend and run behind a production-ready ingress with TLS.
+Create a `.env` file in the project root:
+
+```bash
+# LLM Provider Configuration
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_API_KEY=...
+OLLAMA_API_KEY=...  # For Ollama cloud
+OLLAMA_BASE_URL=http://localhost:11434  # For local Ollama
+
+# Financial Data API
+FINANCIAL_DATASETS_API_KEY=...
+
+# Optional: Model selection (default: ollama-deepseek-v3.1:671b-cloud)
+DEFAULT_MODEL=gpt-4
+DEFAULT_PROVIDER=openai
+
+# Optional: Agent configuration
+MAX_ITERATIONS=5
+DEBUG=false
+```
+
+### Supported Models
+
+**OpenAI**:
+- `gpt-4-turbo-preview`
+- `gpt-4`
+- `gpt-3.5-turbo`
+
+**Anthropic**:
+- `claude-3-opus`
+- `claude-3-sonnet`
+- `claude-3-haiku`
+
+**Google**:
+- `gemini-2.0-pro`
+- `gemini-1.5-pro`
+- `gemini-1.5-flash`
+
+**Ollama**:
+- `ollama-<model-name>` (e.g., `ollama-deepseek-v3.1:671b-cloud`)
+- Prefix with `-cloud` for cloud-hosted Ollama
+
+---
+
+## Development
+
+### Project Stack
+
+**Frontend/TypeScript:**
+- **Framework**: React + Ink (terminal UI)
+- **Language**: TypeScript 5.x
+- **Runtime**: Bun or Node.js
+- **Validation**: Zod (schema validation)
+- **LLM Integration**: LangChain
+
+**Backend/Python:**
+- **Framework**: FastAPI + Uvicorn
+- **Language**: Python 3.10+
+- **CLI**: Typer
+- **LLM Integration**: LangChain
+- **Logging**: Structlog
+- **Rate Limiting**: SlowAPI
+- **Monitoring**: Prometheus
+
+### Type Definitions
+
+#### Understanding Type
+
+```typescript
+interface Understanding {
+  intent: string;
+  entities: Array<{
+    type: 'ticker' | 'date' | 'metric' | 'company' | 'period' | 'other';
+    value: string;
+  }>;
+}
+```
+
+#### Plan Type
+
+```typescript
+interface Plan {
+  summary: string;
+  tasks: Array<{
+    id: string;
+    description: string;
+    status: 'pending' | 'in_progress' | 'completed' | 'failed';
+    taskType: 'use_tools' | 'reason';
+    dependsOn: string[];
+  }>;
+}
+```
+
+#### Task Execution
+
+```typescript
+interface TaskResult {
+  taskId: string;
+  status: 'completed' | 'failed';
+  toolCalls: ToolCallStatus[];
+  result: Record<string, unknown>;
+}
+```
+
+### Testing
+
+```bash
+# TypeScript tests
+bun test
+
+# Watch mode
+bun test --watch
+
+# Python tests
+cd python-backend
+pytest tests/
+pytest tests/ -v  # Verbose
+```
+
+### Code Style
+
+- **TypeScript**: ESLint configured, follows standard patterns
+- **Python**: PEP 8 style guide
+- **Imports**: Organized and grouped appropriately
+
+---
+
+## API Reference
+
+### Agent Orchestrator
+
+#### TypeScript: `Agent` class
+
+```typescript
+const agent = new Agent({
+  model: 'gpt-4',
+  maxIterations: 5,
+  callbacks: {
+    onPhaseStart: (phase) => console.log(`Starting ${phase}`),
+    onPhaseComplete: (phase) => console.log(`Completed ${phase}`),
+    onUnderstandingComplete: (understanding) => { /* ... */ },
+    onAnswerStream: (stream) => { /* ... */ },
+  },
+});
+
+const answer = await agent.run(query, messageHistory);
+```
+
+#### Python: `Agent` class
+
+```python
+from dexter_py.agent.orchestrator import Agent, AgentOptions, AgentCallbacks
+
+agent = Agent(AgentOptions(
+    model='gpt-4',
+    max_iterations=5,
+    callbacks=AgentCallbacks(
+        on_phase_start=lambda phase: print(f'Starting {phase}'),
+        on_understanding_complete=lambda u: print(u),
+    )
+))
+
+answer = await agent.run('What is the P/E ratio of AAPL?')
+```
+
+### LLM Interface
+
+#### TypeScript: `callLlm()`
+
+```typescript
+const result = await callLlm(prompt, {
+  model: 'gpt-4',
+  systemPrompt: 'You are a financial expert.',
+  outputSchema: MySchema,  // Optional Zod schema
+  tools: [tool1, tool2],   // Optional tool definitions
+});
+```
+
+#### Python: `call_llm()`
+
+```python
+from dexter_py.model.llm import call_llm
+
+result = await call_llm(
+    prompt='Analyze this stock...',
+    model='gpt-4',
+    system_prompt='You are a financial expert.',
+    output_model=MyPydanticModel,  # Optional
+    tools=[tool1, tool2],  # Optional
+)
+```
+
+---
+
+## Financial Tools
+
+### Available Tools
+
+All tools are implemented in `src/tools/finance/`:
+
+| Tool | Function | Use Case |
+|------|----------|----------|
+| `get_income_statements` | Fetch income statements | Profitability analysis |
+| `get_balance_sheets` | Fetch balance sheets | Financial position assessment |
+| `get_cash_flow_statements` | Fetch cash flow statements | Liquidity analysis |
+| `get_all_financial_statements` | Fetch all three statements | Comprehensive fundamentals |
+| `get_prices` | Historical & current prices | Price analysis & technical signals |
+| `getFinancialMetrics` | P/E, ROE, debt ratios, etc. | Valuation & efficiency metrics |
+| `getNews` | Company news | Recent developments & events |
+| `getAnalystEstimates` | Earnings estimates & targets | Market expectations |
+| `getSegmentedRevenues` | Business segment data | Segment-level performance |
+| `getCryptoPriceSnapshot` / `getCryptoPrices` | Crypto prices | Digital asset analysis |
+| `getInsiderTrades` | Insider trading data | Insider sentiment |
+| `get10KFilingItems` / `get10QFilingItems` / `get8KFilingItems` | SEC filings | Detailed regulatory disclosures |
+
+### Tool Usage Example
+
+```typescript
+const tool = getIncomeStatements;
+const result = await tool.invoke({
+  ticker: 'AAPL',
+  period: 'annual',
+  limit: 5,
+});
+```
+
+---
+
+## Performance & Resilience
+
+### Built-in Features
+
+- **Retry Logic**: Exponential backoff with jitter for transient failures
+- **Circuit Breakers**: Prevents cascading failures when APIs are down
+- **Rate Limiting**: Respects API rate limits with automatic backoff
+- **Timeouts**: Configurable timeouts prevent hanging requests
+- **Error Tracking**: Detailed error logging for debugging
+- **Structured Logging**: JSON-formatted logs for monitoring
+
+### Configuration
+
+```python
+# In python-backend/dexter_py/model/llm.py
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(RateLimitError),
+)
+async def call_llm(...):
+    # Automatically retries on RateLimitError
+```
 
 ---
 
 ## Contributing
 
-If you'd like to help finish the Python port or improve functionality:
+### Adding New Tools
 
-1. Fork the repo
-2. Create a feature branch
-3. Keep PRs focused and small
-4. Add tests for new behavior
+1. Create tool function in `src/tools/finance/[category].ts`
+2. Use LangChain's `DynamicStructuredTool` wrapper
+3. Add schema validation with Zod
+4. Export from `src/tools/finance/index.ts`
+5. Tool is automatically available to the agent
 
-If you're interested in porting particular modules, good first tasks are:
-- Finish porting the `Execute` phase and `task_executor` with real tool bindings
-- Implement and register finance tools under `python-backend/dexter_py/tools/`
-- Add frontend SSE parsing to convert events into tokens with metadata
+Example:
+
+```typescript
+export const getMyMetric = new DynamicStructuredTool({
+  name: 'get_my_metric',
+  description: 'Fetches my metric from the API',
+  schema: z.object({
+    ticker: z.string().describe('Stock ticker'),
+  }),
+  func: async (input) => {
+    const { data, url } = await callApi('/endpoint', input);
+    return formatToolResult(data, [url]);
+  },
+});
+```
+
+### Adding New LLM Providers
+
+1. Install provider package (e.g., `@langchain/gemini`)
+2. Add conditional import in `src/model/llm.ts`
+3. Add provider factory in `getChatModel()`
+4. Test with sample queries
+5. Document in configuration section
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+**"API key not found" error**
+- Check `.env` file exists and contains correct API key
+- Verify environment variables are loaded: `console.log(process.env.OPENAI_API_KEY)`
+- Ensure no extra spaces or quotes in `.env`
+
+**"Module not found" errors**
+- Run `bun install` (TypeScript) or `pip install -r requirements.txt` (Python)
+- Clear node_modules/venv and reinstall
+
+**Slow agent responses**
+- Check internet connection
+- Verify API rate limits not exceeded
+- Try with a faster model (e.g., GPT-3.5-turbo instead of GPT-4)
+
+**Tool failures**
+- Verify `FINANCIAL_DATASETS_API_KEY` is set
+- Check API key has required permissions
+- Review API documentation for parameter formats
+
+### Debug Mode
+
+```bash
+# TypeScript
+DEBUG=true bun run src/index.tsx
+
+# Python
+DEBUG=true python cli.py ask "your question"
+```
 
 ---
 
 ## License
 
-MIT
+[Add appropriate license information]
 
 ---
 
-If anything is unclear or you'd like me to update the README with screenshots, architecture diagrams, or deployment examples (Docker Compose / Kubernetes), tell me which format you'd prefer and I'll add it.
-# Dexter 🤖
+## Support
 
-Dexter is an autonomous financial research agent that thinks, plans, and learns as it works. It performs analysis using task planning, self-reflection, and real-time market data. Think Claude Code, but built specifically for financial research.
+For issues, questions, or feature requests, please open an issue on the project repository.
 
+---
 
-<img width="979" height="651" alt="Screenshot 2025-10-14 at 6 12 35 PM" src="https://github.com/user-attachments/assets/5a2859d4-53cf-4638-998a-15cef3c98038" />
+## Changelog
 
-## Overview
+### v2.4.1 (Current)
+- Dual-stack architecture with TypeScript primary and Python backend port
+- Phase-based agent orchestration
+- Multi-turn conversation support
+- Streaming responses
+- Multi-provider LLM support
+- Comprehensive financial data tools
 
-Dexter takes complex financial questions and turns them into clear, step-by-step research plans. It runs those tasks using live market data, checks its own work, and refines the results until it has a confident, data-backed answer.  
+### v2.0.0
+- TypeScript implementation of core agent
+- CLI interface with Ink React
+- Tool executor with just-in-time selection
 
-**Key Capabilities:**
-- **Intelligent Task Planning**: Automatically decomposes complex queries into structured research steps
-- **Autonomous Execution**: Selects and executes the right tools to gather financial data
-- **Self-Validation**: Checks its own work and iterates until tasks are complete
-- **Real-Time Financial Data**: Access to income statements, balance sheets, and cash flow statements
-- **Safety Features**: Built-in loop detection and step limits to prevent runaway execution
+### v1.0.0
+- Initial architecture design
+- Basic agent phases
 
-[![Twitter Follow](https://img.shields.io/twitter/follow/virattt?style=social)](https://twitter.com/virattt)
+---
 
-<img width="996" height="639" alt="Screenshot 2025-11-22 at 1 45 07 PM" src="https://github.com/user-attachments/assets/8915fd70-82c9-4775-bdf9-78d5baf28a8a" />
+## Acknowledgments
 
-
-### Prerequisites
-
-- [Bun](https://bun.com) runtime (v1.0 or higher)
-- OpenAI API key (get [here](https://platform.openai.com/api-keys))
-- Financial Datasets API key (get [here](https://financialdatasets.ai))
-- Tavily API key (get [here](https://tavily.com)) - optional, for web search
-
-#### Installing Bun
-
-If you don't have Bun installed, you can install it using curl:
-
-**macOS/Linux:**
-```bash
-curl -fsSL https://bun.com/install | bash
-```
-
-**Windows:**
-```bash
-powershell -c "irm bun.sh/install.ps1|iex"
-```
-
-After installation, restart your terminal and verify Bun is installed:
-```bash
-bun --version
-```
-
-### Installing Dexter
-
-1. Clone the repository:
-```bash
-git clone https://github.com/virattt/dexter.git
-cd dexter
-```
-
-2. Install dependencies with Bun:
-```bash
-bun install
-```
-
-3. Set up your environment variables:
-```bash
-# Copy the example environment file (from parent directory)
-cp env.example .env
-
-# Edit .env and add your API keys
-# OPENAI_API_KEY=your-openai-api-key
-# FINANCIAL_DATASETS_API_KEY=your-financial-datasets-api-key
-# TAVILY_API_KEY=your-tavily-api-key
-```
-
-### Usage
-
-Run Dexter in interactive mode:
-```bash
-bun start
-```
-
-Or with watch mode for development:
-```bash
-bun dev
-```
-
-### Example Queries
-
-Try asking Dexter questions like:
-- "What was Apple's revenue growth over the last 4 quarters?"
-- "Compare Microsoft and Google's operating margins for 2023"
-- "Analyze Tesla's cash flow trends over the past year"
-- "What is Amazon's debt-to-equity ratio based on recent financials?"
-
-Dexter will automatically:
-1. Break down your question into research tasks
-2. Fetch the necessary financial data
-3. Perform calculations and analysis
-4. Provide a comprehensive, data-rich answer
-
-## Architecture
-
-Dexter uses a multi-agent architecture with specialized components:
-
-- **Planning Agent**: Analyzes queries and creates structured task lists
-- **Action Agent**: Selects appropriate tools and executes research steps
-- **Validation Agent**: Verifies task completion and data sufficiency
-- **Answer Agent**: Synthesizes findings into comprehensive responses
-
-## Tech Stack
-
-- **Runtime**: [Bun](https://bun.sh)
-- **UI Framework**: [React](https://react.dev) + [Ink](https://github.com/vadimdemedes/ink) (terminal UI)
-- **LLM Integration**: [LangChain.js](https://js.langchain.com) with multi-provider support (OpenAI, Anthropic, Google)
-- **Schema Validation**: [Zod](https://zod.dev)
-- **Language**: TypeScript
-
-
-### Changing Models
-
-Type `/model` in the CLI to switch between:
-- GPT 4.1 (OpenAI)
-- Claude Sonnet 4.5 (Anthropic)
-- Gemini 3 (Google)
-
-## How to Contribute
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
-**Important**: Please keep your pull requests small and focused.  This will make it easier to review and merge.
-
-
-## License
-
-This project is licensed under the MIT License.
+This project is built on:
+- [LangChain](https://langchain.com/) for LLM orchestration
+- [OpenAI](https://openai.com/), [Anthropic](https://anthropic.com/), and other LLM providers
+- [Financial Datasets API](https://financialdatasets.ai/) for financial data
+- [Ink](https://github.com/vadimdemedes/ink) for terminal UI
+- [FastAPI](https://fastapi.tiangolo.com/) for backend API
 

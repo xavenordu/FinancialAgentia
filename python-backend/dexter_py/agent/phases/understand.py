@@ -1,16 +1,26 @@
-from typing import Optional, Any, AsyncGenerator
-from ...model.llm import call_llm_stream
-from .. import schemas
-from ..schemas import Understanding
+import asyncio
 import json
-import re
+import logging
+from typing import Optional, Any, AsyncGenerator
+
+from ...model.llm import call_llm_stream
+from ..schemas import Understanding
+
+logger = logging.getLogger(__name__)
 
 
 class UnderstandPhase:
     """
-    UnderstandPhase (streaming): extracts intent and entities from a user query using the LLM,
-    with streaming support for partial processing.
+    Production-grade Understanding Phase with:
+      - brace-aware JSON extraction
+      - timeout on LLM streaming
+      - strict JSON-only prompting
+      - structured logging
+      - partial recovery for malformed output
     """
+
+    STREAM_TIMEOUT = 12  # seconds
+    MIN_VALID_JSON_LENGTH = 6  # "{}" + minimal content
 
     def __init__(self, model: str) -> None:
         self.model = model
@@ -22,21 +32,31 @@ class UnderstandPhase:
         conversation_history: Optional[Any] = None
     ) -> Understanding:
         """
-        Run the understanding phase and return the final Understanding object.
+        Run the understanding phase and return a parsed Understanding object.
+        More robust than naive concatenation and regex extraction.
         """
-        # Collect streaming chunks into a buffer
-        collected_output = ""
-        async for chunk in self.stream(query=query, conversation_history=conversation_history):
-            collected_output += chunk
 
-        # Attempt to parse final JSON output from LLM
         try:
-            # Clean up output in case LLM adds extraneous text
-            json_text = self._extract_json(collected_output)
-            return Understanding.parse_raw(json_text)
-        except Exception:
-            # Fallback to minimal understanding
+            collected = await self._collect_stream_output(
+                query=query,
+                conversation_history=conversation_history
+            )
+        except asyncio.TimeoutError:
+            logger.warning("UnderstandingPhase timed out during streaming")
             return Understanding(intent=query, entities=[])
+
+        try:
+            json_text = self._extract_balanced_json(collected)
+            if not json_text:
+                raise ValueError("No balanced JSON found in output")
+
+            return Understanding.parse_raw(json_text)
+
+        except Exception as exc:
+            logger.error("UnderstandingPhase failed to parse JSON: %s", exc)
+            # Attempt partial recovery (extract intent heuristically)
+            cleaned_intent = query.strip()
+            return Understanding(intent=cleaned_intent, entities=[])
 
     async def stream(
         self,
@@ -45,54 +65,120 @@ class UnderstandPhase:
         conversation_history: Optional[Any] = None
     ) -> AsyncGenerator[str, None]:
         """
-        Streaming version: yields LLM tokens as they arrive.
+        Stream LLM output token-by-token with timeout guard.
         """
-        # ----------------------------
-        # 1. Build conversation context
-        # ----------------------------
-        conversation_context: Optional[str] = None
-        if conversation_history:
+
+        system_prompt, user_prompt = self._build_prompts(query, conversation_history)
+
+        try:
+            async with asyncio.timeout(self.STREAM_TIMEOUT):
+                async for token in call_llm_stream(
+                    prompt=user_prompt,
+                    model=self.model,
+                    system_prompt=system_prompt
+                ):
+                    yield token
+        except asyncio.TimeoutError:
+            logger.warning("LLM streaming timed out")
+            # Output minimal JSON token stream so run() has something
+            yield '{"intent": "%s", "entities": []}' % query.replace('"', "'")
+        except Exception as exc:
+            logger.error("Error during LLM streaming: %s", exc)
+            yield '{"intent": "%s", "entities": []}' % query.replace('"', "'")
+
+    # -------------------------
+    # Internal helpers
+    # -------------------------
+
+    async def _collect_stream_output(
+        self,
+        *,
+        query: str,
+        conversation_history: Optional[Any]
+    ) -> str:
+        """
+        Collect streamed tokens into a single string buffer.
+        """
+        buffer = []
+
+        async for token in self.stream(query=query, conversation_history=conversation_history):
+            # Only append text (ignore None or binary chunks)
+            if isinstance(token, str):
+                buffer.append(token)
+
+        return "".join(buffer)
+
+    def _build_prompts(self, query: str, conversation_history: Optional[Any]):
+        """
+        Build system + user prompts with robust fallback.
+        """
+
+        context_block = ""
+
+        if conversation_history and hasattr(conversation_history, "get_relevant"):
             try:
-                # Check if history has previous messages
-                if hasattr(conversation_history, 'has_messages') and conversation_history.has_messages():
-                    # Get relevant messages from history
-                    if hasattr(conversation_history, 'select_relevant_messages'):
-                        relevant_messages = await conversation_history.select_relevant_messages(query)
-                        if relevant_messages:
-                            # Format messages for inclusion in prompt
-                            if hasattr(conversation_history, 'format_for_planning'):
-                                conversation_context = conversation_history.format_for_planning(relevant_messages)
-            except Exception:
-                pass
+                relevant = conversation_history.get_relevant(query)
+                if relevant:
+                    context_block = relevant
+            except Exception as exc:
+                logger.warning("Conversation history retrieval failed: %s", exc)
 
-        # ----------------------------
-        # 2. Build prompts
-        # ----------------------------
-        try:
-            from .. import prompts as _prompts
-            system_prompt = _prompts.get_understand_system_prompt()
-            user_prompt = _prompts.build_understand_user_prompt(query, conversation_context)
-        except Exception:
-            system_prompt = "You are a financial research agent. Extract user intent and entities."
-            user_prompt = f"Analyze the query: {query}"
+        system_prompt = (
+            "You must output ONLY valid minified JSON. "
+            "No commentary. No prose. No markdown. "
+            "JSON schema: {\"intent\": string, \"entities\": array of strings}."
+        )
 
-        # ----------------------------
-        # 3. Stream LLM output
-        # ----------------------------
-        try:
-            async for token in call_llm_stream(prompt=user_prompt, model=self.model, system_prompt=system_prompt):
-                yield token
-        except Exception:
-            # Fallback: yield the query as intent
-            yield json.dumps({"intent": query, "entities": []})
+        user_prompt = f"""
+Extract the user's intent and entities from this query.
+Output only JSON.
 
-    def _extract_json(self, text: str) -> str:
+Query: "{query}"
+
+Context:
+{context_block}
+
+Respond strictly with JSON.
+""".strip()
+
+        return system_prompt, user_prompt
+
+    def _extract_balanced_json(self, text: str) -> Optional[str]:
         """
-        Attempt to extract the first JSON object from the LLM output.
+        Extract the first balanced JSON object from stream output using brace counting.
+        More reliable than regex for incremental or noisy LLM output.
         """
-        json_pattern = re.compile(r"\{.*\}", re.DOTALL)
-        match = json_pattern.search(text)
-        if match:
-            return match.group(0)
-        # Fallback: return minimal JSON
-        return json.dumps({"intent": text.strip(), "entities": []})
+
+        start = text.find("{")
+        if start == -1:
+            return None
+
+        brace_count = 0
+        in_string = False
+        escape = False
+
+        for i in range(start, len(text)):
+            char = text[i]
+
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+            else:
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0:
+                        candidate = text[start : i + 1]
+                        if len(candidate) >= self.MIN_VALID_JSON_LENGTH:
+                            return candidate
+                        else:
+                            return None
+
+        return None

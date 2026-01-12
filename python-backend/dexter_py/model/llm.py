@@ -31,7 +31,8 @@ try:
 except ImportError:
     pass
 DEFAULT_PROVIDER = "openai"
-DEFAULT_MODEL = "ollama-deepseek-v3.1:671b-cloud"  # Local Ollama by default
+DEFAULT_MODEL = "ollama-deepseek-v3.1:671b-cloud" # Local Ollama by default
+# DEFAULT_MODEL = "ollama-mistral:70b"  
 DEFAULT_SYSTEM_PROMPT = (
     "You are FinancialAgentia, an autonomous financial research agent.\n"
     "Your primary objective is to conduct deep and thorough research on stocks and companies to answer user queries.\n"

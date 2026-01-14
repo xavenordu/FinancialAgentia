@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 import asyncio
 from asyncio import Lock, TimeoutError as AsyncTimeoutError
 from time import time
+from xml.parsers.expat import model
 import structlog
 from enum import Enum
 import uuid
@@ -279,6 +280,7 @@ class Orchestrator:
 
     def __init__(self, options: AgentOptions) -> None:
         self.model = options.model
+        self.llm_client = None  # Placeholder for LLM client initialization
         self.callbacks = options.callbacks or AgentCallbacks()
         self.max_iterations = options.max_iterations or DEFAULT_MAX_ITERATIONS
         self.phase_timeouts = options.phase_timeouts or PHASE_TIMEOUTS
@@ -297,12 +299,13 @@ class Orchestrator:
         
         # Initialize phases (allow custom implementations)
         custom_phases = options.custom_phases or {}
+        
         self.phases = {
             'understand': custom_phases.get('understand', UnderstandPhase(model=self.model)),
             'plan': custom_phases.get('plan', PlanPhase(model=self.model)),
             'execute': custom_phases.get('execute', ExecutePhase(model=self.model)),
             'reflect': custom_phases.get('reflect', ReflectPhase(model=self.model, max_iterations=self.max_iterations)),
-            'answer': custom_phases.get('answer', AnswerPhase(model=self.model, context_manager=self.context_manager)),
+            'answer': custom_phases.get('answer', AnswerPhase(model=self.model, context_manager=self.context_manager, llm_client=self.llm_client)),
         }
         
         # Tool execution with retry logic

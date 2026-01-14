@@ -6,7 +6,7 @@ It intentionally supports OpenAI by default; other providers may be added later.
 import os
 import asyncio
 import json
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_not_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_not_exception_type, RetryError
 from openai import RateLimitError
 import pybreaker
 from typing import Any, Optional, List, AsyncGenerator, Type, TypeVar
@@ -22,25 +22,38 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TIMEOUT = 120
 
-# Try to import langchain; if not available, we'll raise a helpful error at runtime.
+# Try to import langchain providers; set None when not available so checks are safe
+ChatOpenAI = None
+ChatAnthropic = None
+ChatGoogleGenerativeAI = None
+ChatOllama = None
+HumanMessage = None
+SystemMessage = None
 try:
     from langchain_openai import ChatOpenAI
-    # Optional providers - may not be present in all langchain installs
-    try:
-        from langchain_anthropic import ChatAnthropic  # type: ignore
-    except Exception:
-        ChatAnthropic = None  # type: ignore
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
-    except Exception:
-        ChatGoogleGenerativeAI = None  # type: ignore
-    try:
-        from langchain_ollama import ChatOllama  # type: ignore
-    except Exception:
-        ChatOllama = None  # type: ignore
+except Exception:
+    ChatOpenAI = None
+
+try:
+    from langchain_anthropic import ChatAnthropic  # type: ignore
+except Exception:
+    ChatAnthropic = None  # type: ignore
+
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
+except Exception:
+    ChatGoogleGenerativeAI = None  # type: ignore
+
+try:
+    from langchain_ollama import ChatOllama  # type: ignore
+except Exception:
+    ChatOllama = None  # type: ignore
+
+try:
     from langchain_core.messages import HumanMessage, SystemMessage
-except ImportError:
-    pass
+except Exception:
+    HumanMessage = None
+    SystemMessage = None
 
 from ..utils._utils import _classify_error, _build_system_prompt_with_tools, get_llm_client, LLMError, LLMRateLimitError, LLMTimeoutError, LLMParseError
 DEFAULT_PROVIDER = "openai"

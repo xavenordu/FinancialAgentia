@@ -87,12 +87,26 @@ _client_instance = None
 _client_lock = asyncio.Lock()
 
 
+# LangChain provider imports - make optional so module can be imported even if
+# some provider packages are not installed. Each provider var is initialized
+# to None and set only when the import succeeds.
+ChatAnthropic = None
+ChatOpenAI = None
+ChatOllama = None
 try:
     from langchain_anthropic import ChatAnthropic
-except ImportError:
-    pass
-from langchain_openai import ChatOpenAI
-from langchain_ollama import ChatOllama
+except Exception:
+    ChatAnthropic = None
+
+try:
+    from langchain_openai import ChatOpenAI
+except Exception:
+    ChatOpenAI = None
+
+try:
+    from langchain_ollama import ChatOllama
+except Exception:
+    ChatOllama = None
 
 
 async def get_llm_client():

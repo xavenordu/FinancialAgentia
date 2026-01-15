@@ -21,6 +21,7 @@ from .phases.reflect import ReflectPhase
 from .phases.answer import AnswerPhase
 from .tool_executor import ToolExecutor
 from .task_executor import TaskExecutor
+from ..utils._utils import get_production_llm_client
 
 
 # Constants
@@ -280,7 +281,10 @@ class Orchestrator:
 
     def __init__(self, options: AgentOptions) -> None:
         self.model = options.model
-        self.llm_client = None  # Placeholder for LLM client initialization
+    # Initialize a production LLM client wrapper (convenience adapter)
+    # This returns an object exposing async `complete` and `stream` methods
+    # suitable for the AnswerPhase protocol.
+    self.llm_client = get_production_llm_client()
         self.callbacks = options.callbacks or AgentCallbacks()
         self.max_iterations = options.max_iterations or DEFAULT_MAX_ITERATIONS
         self.phase_timeouts = options.phase_timeouts or PHASE_TIMEOUTS

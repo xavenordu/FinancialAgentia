@@ -108,6 +108,12 @@ try:
 except Exception:
     ChatOllama = None
 
+# Optional LangChain async callback handler (used for streaming tokens)
+try:
+    from langchain.callbacks.base import AsyncCallbackHandler
+except Exception:
+    AsyncCallbackHandler = None
+
 
 async def get_llm_client():
     """

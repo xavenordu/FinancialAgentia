@@ -434,6 +434,60 @@ async def call_llm_stream(
 
     # Try provider-specific streaming where available
     try:
+        # Prepare message wrapper for LangChain-style calls
+        if HumanMessage is not None and SystemMessage is not None:
+            msg_system = SystemMessage(content=enhanced_system_prompt)
+            msg_user = HumanMessage(content=prompt)
+            messages_wrapper = [[msg_system, msg_user]]
+        else:
+            messages_wrapper = [[{"role": "system", "content": enhanced_system_prompt}, {"role": "user", "content": prompt}]]
+
+        # If LangChain async callback handler is available, attempt true streaming
+        if AsyncCallbackHandler is not None and hasattr(client, 'agenerate'):
+            q: asyncio.Queue = asyncio.Queue()
+
+            class _QueueHandler(AsyncCallbackHandler):
+                async def on_llm_new_token(self, token: str, **kwargs):
+                    await q.put(token)
+
+                async def on_llm_end(self, *args, **kwargs):
+                    # signal end of stream
+                    await q.put(None)
+
+            handler = _QueueHandler()
+
+            async def _run_agenerate():
+                try:
+                    try:
+                        await client.agenerate(messages_wrapper, callbacks=[handler])
+                    except TypeError:
+                        # some versions expect messages= kwarg
+                        await client.agenerate(messages=messages_wrapper, callbacks=[handler])
+                except Exception as e:
+                    # on error, push sentinel to avoid hanging consumer
+                    try:
+                        await q.put(None)
+                    except Exception:
+                        pass
+                    raise
+
+            task = asyncio.create_task(_run_agenerate())
+
+            # yield tokens as they arrive
+            try:
+                while True:
+                    token = await q.get()
+                    if token is None:
+                        break
+                    if token:
+                        yield token
+                # ensure task finished
+                await task
+                return
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+
         # Primary: provider SDK with messages.stream (original approach)
         if hasattr(client, 'messages') and hasattr(client.messages, 'stream'):
             async with client.messages.stream(

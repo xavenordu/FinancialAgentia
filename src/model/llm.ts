@@ -58,7 +58,7 @@ const DEFAULT_MODEL_FACTORY: ModelFactory = (name, opts) =>
   new ChatOpenAI({
     model: name,
     ...opts,
-    apiKey: process.env.OPENAI_KEY,
+    apiKey: process.env.OPENAI_API_KEY,
   });
 
 export function getChatModel(

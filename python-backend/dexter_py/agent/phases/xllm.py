@@ -20,22 +20,14 @@ from tenacity import (
     retry_if_exception_type
 )
 from pydantic import BaseModel, ValidationError
+from ..utils._utils import get_llm_config, get_llm_client
 
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
-@dataclass
-class LLMConfig:
-    """Configuration for LLM client."""
-    model: str = "claude-sonnet-4"
-    max_tokens: int = 4096
-    temperature: float = 0.7
-    api_timeout: int = 120
-    retry_attempts: int = 3
-    retry_min_wait: int = 1
-    retry_max_wait: int = 10
+# Use centralized LLMConfig from utils._utils via get_llm_config()
 
 
 @dataclass
@@ -88,7 +80,7 @@ class ProductionLLMClient:
     def __init__(
         self,
         api_key: str,
-        config: Optional[LLMConfig] = None,
+        config: Optional[Any] = None,
         logger: Optional[structlog.BoundLogger] = None
     ):
         """
@@ -100,7 +92,22 @@ class ProductionLLMClient:
             logger: Optional logger instance
         """
         self.api_key = api_key
-        self.config = config or LLMConfig()
+        if config is None:
+            shared = get_llm_config()
+            # Map shared config fields to expected attribute names
+            class _C:
+                pass
+            c = _C()
+            c.model = getattr(shared, 'default_model', getattr(shared, 'model', ''))
+            c.max_tokens = getattr(shared, 'default_max_tokens', getattr(shared, 'max_tokens', 4096))
+            c.temperature = getattr(shared, 'default_temperature', getattr(shared, 'temperature', 0.7))
+            c.api_timeout = getattr(shared, 'timeout', getattr(shared, 'api_timeout', 120))
+            c.retry_attempts = getattr(shared, 'retry_attempts', 3)
+            c.retry_min_wait = getattr(shared, 'retry_min_wait', 1)
+            c.retry_max_wait = getattr(shared, 'retry_max_wait', 10)
+            self.config = c
+        else:
+            self.config = config
         self.logger = logger or structlog.get_logger(__name__)
         
         # Initialize API client (example using Anthropic)
@@ -730,85 +737,11 @@ DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TIMEOUT = 120
 
 
-@dataclass
-class LLMConfig:
-    """Global LLM configuration."""
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
-    default_model: str = DEFAULT_MODEL
-    default_max_tokens: int = DEFAULT_MAX_TOKENS
-    default_temperature: float = DEFAULT_TEMPERATURE
-    timeout: int = DEFAULT_TIMEOUT
-    retry_attempts: int = 3
-    retry_min_wait: float = 1.0
-    retry_max_wait: float = 10.0
+# Use centralized LLM configuration via utils._utils.get_llm_config()
 
 
-# Global config instance
-_llm_config = LLMConfig()
-
-
-def configure_llm(config: LLMConfig) -> None:
-    """Configure global LLM settings."""
-    global _llm_config
-    _llm_config = config
-
-
-def get_llm_config() -> LLMConfig:
-    """Get current LLM configuration."""
-    return _llm_config
-
-
-# ============================================================================
-# Client Initialization
-# ============================================================================
-
-_client_instance = None
-_client_lock = asyncio.Lock()
-
-
-async def get_llm_client():
-    """
-    Get or create LLM client singleton.
-    Thread-safe lazy initialization.
-    """
-    global _client_instance
-    
-    if _client_instance is not None:
-        return _client_instance
-    
-    async with _client_lock:
-        # Double-check after acquiring lock
-        if _client_instance is not None:
-            return _client_instance
-        
-        config = get_llm_config()
-        
-        try:
-            from anthropic import AsyncAnthropic
-            
-            api_key = config.api_key or os.getenv("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise ValueError(
-                    "ANTHROPIC_API_KEY not set. "
-                    "Set via environment variable or configure_llm()"
-                )
-            
-            _client_instance = AsyncAnthropic(
-                api_key=api_key,
-                base_url=config.base_url,
-                timeout=config.timeout
-            )
-            
-            logger = structlog.get_logger(__name__)
-            logger.info("llm_client_initialized", model=config.default_model)
-            
-            return _client_instance
-            
-        except ImportError:
-            raise ImportError(
-                "anthropic package required. Install: pip install anthropic"
-            )
+# Client initialization and configuration are centralized in utils._utils
+# Use get_llm_client() and get_llm_config() from there for a single source of truth.
 
 
 # ============================================================================

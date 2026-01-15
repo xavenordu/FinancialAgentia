@@ -54,8 +54,22 @@ try:
 except Exception:
     HumanMessage = None
     SystemMessage = None
+try:
+    from langchain.callbacks.base import AsyncCallbackHandler
+except Exception:
+    AsyncCallbackHandler = None
 
-from ..utils._utils import _classify_error, _build_system_prompt_with_tools, get_llm_client, LLMError, LLMRateLimitError, LLMTimeoutError, LLMParseError
+from ..utils._utils import (
+    _classify_error,
+    _build_system_prompt_with_tools,
+    get_llm_client,
+    get_llm_config,
+    configure_llm,
+    LLMError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+    LLMParseError,
+)
 DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "ollama-qwen3-coder:480b-cloud" # Local Ollama by default
 # DEFAULT_MODEL = "ollama-mistral:70b"  
@@ -351,33 +365,7 @@ async def call_llm(
     
     return content
 
-@dataclass
-class LLMConfig:
-    """Global LLM configuration."""
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
-    default_model: str = DEFAULT_MODEL
-    default_max_tokens: int = DEFAULT_MAX_TOKENS
-    default_temperature: float = DEFAULT_TEMPERATURE
-    timeout: int = DEFAULT_TIMEOUT
-    retry_attempts: int = 3
-    retry_min_wait: float = 1.0
-    retry_max_wait: float = 10.0
-
-
-# Global config instance
-_llm_config = LLMConfig()
-
-
-def configure_llm(config: LLMConfig) -> None:
-    """Configure global LLM settings."""
-    global _llm_config
-    _llm_config = config
-
-
-def get_llm_config() -> LLMConfig:
-    """Get current LLM configuration."""
-    return _llm_config
+# Use centralized LLMConfig via utils._utils.get_llm_config()
 
 
 async def call_llm_stream(

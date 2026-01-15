@@ -431,11 +431,73 @@ class Orchestrator:
         Get existing history from session store or create new one.
         Thread-safe with session locking.
         """
+        # If an external message_history was supplied for this run, use it directly
+        ext_history = getattr(self, "_external_message_history", None)
+        if ext_history is not None:
+            return ext_history
+
+        # If an external session_store was supplied, attempt to use it.
+        ext_store = getattr(self, "_external_session_store", None)
+        if ext_store is not None:
+            # No session id -> isolated history
+            if not session_id:
+                self.logger.info("creating_isolated_history_external", run_id=run_id)
+                return MessageHistory(model=self.model)
+
+            # Try to acquire a lock from external store if provided
+            lock = None
+            try:
+                get_lock = getattr(ext_store, 'get_lock', None)
+                if callable(get_lock):
+                    # If get_lock is async, await it; else call in thread
+                    if asyncio.iscoroutinefunction(get_lock):
+                        lock = await get_lock(session_id)
+                    else:
+                        # wrap sync lock retrieval in thread
+                        lock = await asyncio.to_thread(lambda: get_lock(session_id))
+            except Exception:
+                lock = None
+
+            # If lock supports async context manager, use it, otherwise proceed without it
+            if lock is not None and hasattr(lock, "__aenter__"):
+                async with lock:
+                    history = await (ext_store.get(session_id) if asyncio.iscoroutinefunction(ext_store.get) else asyncio.to_thread(lambda: ext_store.get(session_id)))
+                    if history is None:
+                        self.logger.info("creating_new_session_external", session_id=session_id, run_id=run_id)
+                        history = MessageHistory(model=self.model)
+                        await (ext_store.set(session_id, history) if asyncio.iscoroutinefunction(ext_store.set) else asyncio.to_thread(lambda: ext_store.set(session_id, history)))
+                    else:
+                        self.logger.info("loaded_existing_session_external", session_id=session_id, run_id=run_id, message_count=len(history.get_messages()))
+                    return history
+
+            # No async lock available; do non-locked access but in thread to avoid blocking
+            try:
+                history = await (ext_store.get(session_id) if asyncio.iscoroutinefunction(ext_store.get) else asyncio.to_thread(lambda: ext_store.get(session_id)))
+            except Exception as e:
+                self.logger.warning("external_session_store_get_failed", error=str(e))
+                history = None
+
+            if history is None:
+                self.logger.info("creating_new_session_external", session_id=session_id, run_id=run_id)
+                history = MessageHistory(model=self.model)
+                try:
+                    if asyncio.iscoroutinefunction(ext_store.set):
+                        await ext_store.set(session_id, history)
+                    else:
+                        await asyncio.to_thread(lambda: ext_store.set(session_id, history))
+                except Exception as e:
+                    self.logger.warning("external_session_store_set_failed", error=str(e))
+            else:
+                self.logger.info("loaded_existing_session_external", session_id=session_id, run_id=run_id, message_count=len(history.get_messages()))
+
+            return history
+
+        # Fallback: use orchestrator's internal async session store
         if not session_id:
             # No session - create isolated history for this run
             self.logger.info("creating_isolated_history", run_id=run_id)
             return MessageHistory(model=self.model)
-        
+
         # Session-based history with locking
         lock = self.session_store.get_lock(session_id)
         
@@ -469,7 +531,21 @@ class Orchestrator:
         """Save history back to session store if session_id provided"""
         if not session_id:
             return
-        
+
+        # If external session store was provided for this run, use it
+        ext_store = getattr(self, "_external_session_store", None)
+        if ext_store is not None:
+            try:
+                if asyncio.iscoroutinefunction(ext_store.set):
+                    await ext_store.set(session_id, history)
+                else:
+                    await asyncio.to_thread(lambda: ext_store.set(session_id, history))
+                self.logger.info("saved_session_external", session_id=session_id, run_id=run_id, message_count=len(history.get_messages()))
+            except Exception as e:
+                self.logger.warning("external_session_store_set_failed", error=str(e))
+            return
+
+        # Default internal async session store behavior
         lock = self.session_store.get_lock(session_id)
         
         async with lock:
@@ -486,6 +562,8 @@ class Orchestrator:
         query: str,
         session_id: Optional[str] = None,
         skip_phases: Optional[List[str]] = None,
+        session_store: Optional[Any] = None,
+        message_history: Optional[MessageHistory] = None,
     ) -> str:
         """
         Run the agent with a query.
@@ -512,6 +590,11 @@ class Orchestrator:
             max_iterations=self.max_iterations
         )
         
+        # Allow caller to pass an external session store or a preloaded message_history.
+        # These will be used for the duration of this run only.
+        self._external_session_store = session_store
+        self._external_message_history = message_history
+
         try:
             # Get or create isolated history for this run
             history = await self._get_or_create_history(session_id, run_id)
@@ -702,20 +785,32 @@ class Orchestrator:
             )
             
             return final_answer
-            
+
         except Exception as exc:
             metrics.record_error('orchestrator', str(exc))
             metrics.finalize(StopReason.ERROR)
-            
+
             self.logger.error(
                 "run_failed",
                 run_id=run_id,
                 error=str(exc),
                 metrics=metrics.to_dict()
             )
-            
+
             # Re-raise to caller
             raise
+        finally:
+            # Clean up any external session store/message history bindings
+            if hasattr(self, '_external_session_store'):
+                try:
+                    del self._external_session_store
+                except Exception:
+                    pass
+            if hasattr(self, '_external_message_history'):
+                try:
+                    del self._external_message_history
+                except Exception:
+                    pass
 
     async def clear_session(self, session_id: str) -> None:
         """Clear a session from the store"""

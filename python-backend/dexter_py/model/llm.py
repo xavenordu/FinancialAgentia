@@ -202,31 +202,106 @@ async def call_llm(
     async def _make_request() -> str:
         """Inner function with retry logic."""
         client = await get_llm_client()
-        
+
+        # Build a messages structure that we can pass to different clients.
+        # Use HumanMessage/SystemMessage when available, otherwise fall back to
+        # role/content dicts which some lower-level SDKs accept.
+        if HumanMessage is not None and SystemMessage is not None:
+            msg_system = SystemMessage(content=enhanced_system_prompt)
+            msg_user = HumanMessage(content=enhanced_prompt)
+            messages_for_client = [msg_system, msg_user]
+            messages_wrapper = [[msg_system, msg_user]]
+        else:
+            messages_for_client = [{"role": "system", "content": enhanced_system_prompt}, {"role": "user", "content": enhanced_prompt}]
+            messages_wrapper = [[{"role": "system", "content": enhanced_system_prompt}, {"role": "user", "content": enhanced_prompt}]]
+
         try:
-            response = await asyncio.wait_for(
-                client.messages.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    system=enhanced_system_prompt,
-                    messages=[{"role": "user", "content": enhanced_prompt}],
-                    **kwargs
-                ),
-                timeout=config.timeout
-            )
-            
-            # Extract text from response
-            if hasattr(response, 'content') and isinstance(response.content, list):
-                text_blocks = [
-                    block.text for block in response.content
-                    if hasattr(block, 'text')
-                ]
-                content = "".join(text_blocks)
+            # Primary: some provider SDKs expose a messages.create API (original code)
+            if hasattr(client, 'messages') and hasattr(client.messages, 'create'):
+                response = await asyncio.wait_for(
+                    client.messages.create(
+                        model=model,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        system=enhanced_system_prompt,
+                        messages=[{"role": "user", "content": enhanced_prompt}],
+                        **kwargs
+                    ),
+                    timeout=config.timeout
+                )
+
+            # Secondary: LangChain ChatModel async generation interfaces
+            elif hasattr(client, 'agenerate'):
+                # agenerate often expects a list of message-lists
+                try:
+                    resp = await asyncio.wait_for(
+                        client.agenerate(messages_wrapper, **kwargs),
+                        timeout=config.timeout
+                    )
+                except TypeError:
+                    # Some versions expect `messages=` kwarg
+                    resp = await asyncio.wait_for(
+                        client.agenerate(messages=messages_wrapper, **kwargs),
+                        timeout=config.timeout
+                    )
+                response = resp
+
+            elif hasattr(client, 'agenerate_messages'):
+                resp = await asyncio.wait_for(
+                    client.agenerate_messages(messages_wrapper, **kwargs),
+                    timeout=config.timeout
+                )
+                response = resp
+
+            # Synchronous/async predict fallback
+            elif hasattr(client, 'apredict'):
+                resp_text = await asyncio.wait_for(
+                    client.apredict(enhanced_prompt, **kwargs),
+                    timeout=config.timeout
+                )
+                response = resp_text
+
+            elif hasattr(client, 'predict'):
+                # run blocking predict in a thread
+                resp_text = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: client.predict(enhanced_prompt, **kwargs)),
+                    timeout=config.timeout
+                )
+                response = resp_text
+
             else:
+                raise RuntimeError("LLM client does not expose a supported API for sending messages")
+
+            # Extract text from various response shapes
+            content = None
+            # If the response is already a string
+            if isinstance(response, str):
+                content = response
+
+            # LangChain v0.x-style response
+            elif hasattr(response, 'generations'):
+                try:
+                    first = response.generations[0][0]
+                    if hasattr(first, 'text'):
+                        content = first.text
+                    elif hasattr(first, 'message') and hasattr(first.message, 'content'):
+                        content = first.message.content
+                except Exception:
+                    content = str(response)
+
+            # Some SDK responses have `content` attribute or list of content blocks
+            elif hasattr(response, 'content'):
+                if isinstance(response.content, list):
+                    text_blocks = [getattr(block, 'text', str(block)) for block in response.content]
+                    content = "".join(text_blocks)
+                else:
+                    content = str(response.content)
+
+            else:
+                # Fallback to string conversion
                 content = str(response)
-            
-            # Log usage
+
+            # Log usage if available
             if hasattr(response, 'usage'):
                 usage = response.usage
                 logger.info(
@@ -234,20 +309,18 @@ async def call_llm(
                     input_tokens=getattr(usage, 'input_tokens', 0),
                     output_tokens=getattr(usage, 'output_tokens', 0)
                 )
-            
+
             return content
-            
-        except asyncio.TimeoutError as e:
+
+        except asyncio.TimeoutError:
             raise LLMTimeoutError(f"Request timeout after {config.timeout}s")
-            
         except Exception as e:
-            # Classify and potentially wrap error
             classified = _classify_error(e)
             logger.error(
                 "llm_request_failed",
                 error=str(e),
                 error_type=type(e).__name__,
-                classified_type=type(classified).__name__
+                classified_type=type(classified).__name__ if classified is not None else None
             )
             raise classified
     
@@ -358,37 +431,47 @@ async def call_llm_stream(
     )
     
     client = await get_llm_client()
-    
+
+    # Try provider-specific streaming where available
     try:
-        async with client.messages.stream(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=enhanced_system_prompt,
-            messages=[{"role": "user", "content": prompt}],
-            **kwargs
-        ) as stream:
-            async for text in stream.text_stream:
-                if text:  # Filter empty strings
-                    yield text
-        
-        # Log final usage
-        try:
-            final_message = await stream.get_final_message()
-            if hasattr(final_message, 'usage'):
-                usage = final_message.usage
-                logger.info(
-                    "llm_stream_complete",
-                    input_tokens=getattr(usage, 'input_tokens', 0),
-                    output_tokens=getattr(usage, 'output_tokens', 0)
-                )
-        except Exception:
-            pass  # Don't fail on metrics
-        
+        # Primary: provider SDK with messages.stream (original approach)
+        if hasattr(client, 'messages') and hasattr(client.messages, 'stream'):
+            async with client.messages.stream(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=enhanced_system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+                **kwargs
+            ) as stream:
+                async for text in stream.text_stream:
+                    if text:
+                        yield text
+
+            # Try to log final usage (best-effort)
+            try:
+                final_message = await stream.get_final_message()
+                if hasattr(final_message, 'usage'):
+                    usage = final_message.usage
+                    logger.info(
+                        "llm_stream_complete",
+                        input_tokens=getattr(usage, 'input_tokens', 0),
+                        output_tokens=getattr(usage, 'output_tokens', 0)
+                    )
+            except Exception:
+                pass
+
+        else:
+            # Fallback: streaming not supported by client interface. Call non-streaming
+            # and yield the full content as a single chunk so callers still get a result.
+            logger.debug("llm_stream_fallback_to_non_streaming", model=model)
+            content = await call_llm(prompt, model=model, system_prompt=system_prompt, tools=tools, max_tokens=max_tokens, temperature=temperature, **kwargs)
+            if content:
+                yield content
+
     except asyncio.CancelledError:
         logger.info("llm_stream_cancelled")
         raise
-        
     except Exception as e:
         logger.error("llm_stream_failed", error=str(e), error_type=type(e).__name__)
         raise LLMError(f"Streaming failed: {str(e)}")
